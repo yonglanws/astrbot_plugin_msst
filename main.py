@@ -510,7 +510,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.0", "https://github.com/yonglanws/astrbot_plugin_msst")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.1", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -2498,14 +2498,13 @@ class MySekaiStorytellerPlugin(Star):
         else:
             yield event.plain_result(f"视频导出失败: {result.get('message', '未知错误')}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command_group("mssadmin")
     def mssadmin(self):
-        """MySekaiStoryteller 管理指令组（仅管理员）"""
+        """MySekaiStoryteller 管理指令组（子指令仅管理员）"""
         pass
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("status", alias={'状态', '系统状态', '查看状态'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def status(self, event: AstrMessageEvent):
         """查看插件状态"""
         health = await self._check_mss_api_health()
@@ -2520,8 +2519,8 @@ class MySekaiStorytellerPlugin(Star):
         status_text += self.get_stats_report()
         yield event.plain_result(status_text)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("queue", alias={'队列', '排队', '队列状态'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def queue_status_cmd(self, event: AstrMessageEvent):
         """查看队列状态"""
         queue_stats = await self.export_queue.get_queue_stats()
@@ -2535,8 +2534,8 @@ class MySekaiStorytellerPlugin(Star):
         )
         yield event.plain_result(status_text)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("cancel", alias={'取消', '终止', '停止'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cancel_task_cmd(self, event: AstrMessageEvent, task_id: str):
         """取消指定任务"""
         success = await self.export_queue.cancel_task(task_id)
@@ -2545,8 +2544,8 @@ class MySekaiStorytellerPlugin(Star):
         else:
             yield event.plain_result(f"❌ 无法取消任务 {task_id[:8]}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("cleanup", alias={'清理', '清理文件', '删除临时文件'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cleanup(self, event: AstrMessageEvent):
         """清理文件"""
         cleaned = 0
@@ -2565,8 +2564,8 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"清理文件失败: {e}")
         yield event.plain_result(f"已清理 {cleaned} 个文件")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("resources", alias={'资源列表', '模型列表', '资源'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def resources_cmd(self, event: AstrMessageEvent):
         """查看渲染宿主当前可用的角色/背景/BGM 资源"""
         data = await self._catalog.refresh()
@@ -2587,8 +2586,8 @@ class MySekaiStorytellerPlugin(Star):
         lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记，约 30 秒后自动感知")
         yield event.plain_result("\n".join(lines))
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("setapi", alias={'设置api', '设置API', '更新api'})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def set_api(self, event: AstrMessageEvent, url: str):
         """设置 MSS API 地址"""
         self.mss_api_url = url
