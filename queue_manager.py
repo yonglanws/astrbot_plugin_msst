@@ -63,17 +63,17 @@ class VideoExportQueue:
             "total_failed": 0,
             "total_cancelled": 0
         }
-        # 高并发优化：用户任务聚合，同一用户的多个任务合并处理
-        self._user_task_groups: dict[str, list[str]] = {}
+        self._start_lock = asyncio.Lock()
 
     async def start(self):
-        """启动队列处理器和清理任务"""
-        if self._running:
-            return
-        self._running = True
-        self._processor_task = asyncio.create_task(self.process_queue())
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        logger.info(f"视频导出队列已启动（并发={self._max_concurrent}, 容量={self._max_queue_size}）")
+        """启动队列处理器和清理任务（并发调用安全）"""
+        async with self._start_lock:
+            if self._running:
+                return
+            self._running = True
+            self._processor_task = asyncio.create_task(self.process_queue())
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            logger.info(f"视频导出队列已启动（并发={self._max_concurrent}, 容量={self._max_queue_size}）")
 
     async def stop(self):
         """停止队列处理器"""
@@ -99,7 +99,11 @@ class VideoExportQueue:
                        timeout_seconds: int = None, max_retries: int = None) -> str:
         """添加任务到队列（优化版：支持用户任务聚合）"""
         async with self._lock:
-            if len(self._queue) + len(self._running_tasks) >= self._max_queue_size:
+            pending_and_running = (
+                sum(1 for t in self._queue if t.status == TaskStatus.PENDING)
+                + len(self._running_tasks)
+            )
+            if pending_and_running >= self._max_queue_size:
                 raise QueueFullError(
                     f"队列已满（{self._max_queue_size}），请稍后重试"
                 )
@@ -131,12 +135,7 @@ class VideoExportQueue:
             
             # 优化排序：优先级 > 创建时间 > 用户公平性
             self._queue.sort(key=lambda t: (t.priority, t.created_at))
-            
-            # 记录用户任务组
-            if user_id not in self._user_task_groups:
-                self._user_task_groups[user_id] = []
-            self._user_task_groups[user_id].append(task_id)
-            
+
             self._task_events[task_id] = asyncio.Event()
             self._stats["total_enqueued"] += 1
 
@@ -284,15 +283,17 @@ class VideoExportQueue:
 
                     tasks_to_start = []
                     processed_users = set()
+                    still_pending: list[QueueTask] = []
 
                     for task in self._queue:
                         if task.status != TaskStatus.PENDING:
                             continue
 
-                        if len(tasks_to_start) >= available_slots:
-                            break
-
-                        if task.user_id in processed_users:
+                        if (
+                            len(tasks_to_start) >= available_slots
+                            or task.user_id in processed_users
+                        ):
+                            still_pending.append(task)
                             continue
 
                         processed_users.add(task.user_id)
@@ -301,8 +302,7 @@ class VideoExportQueue:
                         self._running_tasks[task.task_id] = task
                         tasks_to_start.append(task)
 
-                    self._queue = [t for t in self._queue
-                                  if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)]
+                    self._queue = still_pending
 
                 if tasks_to_start:
                     for task in tasks_to_start:
@@ -345,6 +345,12 @@ class VideoExportQueue:
                 logger.warning(f"任务超时: {task.task_id[:8]}, "
                                f"用户={task.user_id}")
 
+            except asyncio.CancelledError:
+                task.status = TaskStatus.CANCELLED
+                task.error = "任务已取消"
+                task.completed_at = time.time()
+                self._stats["total_cancelled"] += 1
+                logger.info(f"任务已取消: {task.task_id[:8]}")
             except Exception as e:
                 task.error = str(e)
                 logger.error(f"任务执行失败: {task.task_id[:8]}, 错误={e}")
@@ -356,8 +362,9 @@ class VideoExportQueue:
                     task.error = None
 
                     async with self._lock:
-                        self._queue.append(task)
-                        self._queue.sort(key=lambda t: (t.priority, t.created_at))
+                        if not any(t.task_id == task.task_id for t in self._queue):
+                            self._queue.append(task)
+                            self._queue.sort(key=lambda t: (t.priority, t.created_at))
 
                     logger.info(f"任务将重试: {task.task_id[:8]}, "
                                 f"第{task.retry_count}次重试")
@@ -373,11 +380,16 @@ class VideoExportQueue:
                 if task.task_id in self._running_tasks:
                     del self._running_tasks[task.task_id]
 
-                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT):
+                # 仅在终态唤醒等待方；重试入队时保持 Event 未置位，避免监控器提前报异常
+                if task.status in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.TIMEOUT,
+                    TaskStatus.CANCELLED,
+                ):
                     self._completed_tasks[task.task_id] = task
-
-                if task.task_id in self._task_events:
-                    self._task_events[task.task_id].set()
+                    if task.task_id in self._task_events:
+                        self._task_events[task.task_id].set()
 
     async def _cleanup_loop(self):
         """定期清理已完成的任务"""

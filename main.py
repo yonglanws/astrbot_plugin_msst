@@ -5,6 +5,7 @@ import re
 import time
 import shutil
 import socket
+import uuid
 import httpx
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,23 @@ from astrbot.api import AstrBotConfig
 
 from .queue_manager import VideoExportQueue, QueueFullError
 from .resource_catalog import ResourceCatalog
+from .persona import PersonaRegistry
+
+# 未配置人格的角色的兜底演绎文案（默认不内置任何人设提示词）
+GENERIC_PROFILE_TEXT = (
+    "基本档案与性格：未提供详细人设，请依据角色名与场景合理演绎，"
+    "保持言行前后一致，风格贴近视觉小说中的同类角色。"
+)
+
+
+def _fill_template(template: str, mapping: dict[str, str]) -> str:
+    """单遍模板替换：一次性匹配所有占位符后同时替换。
+
+    占位符的值里即使出现 '{xxx}' 字样也不会被二次展开，
+    避免用户内容/人格文本注入其他占位符。
+    """
+    pattern = re.compile("|".join(re.escape(token) for token in mapping))
+    return pattern.sub(lambda m: mapping[m.group(0)], template)
 
 STORY_JSON_SCHEMA = {
     "type": "object",
@@ -182,7 +200,7 @@ SNIPPET_SCHEMAS = {
                 "required": ["speaker", "content"],
                 "properties": {
                     "speaker": {"type": "string", "description": "说话者名字"},
-                    "content": {"type": "string", "description": "对话内容，禁止换行"},
+                    "content": {"type": "string", "description": "对话内容，可用 \\n 换行"},
                     "modelId": {"type": "number", "default": -1},
                     "voice": {"type": "string", "default": ""},
                     "motion": {"type": "string", "default": "", "description": "说话时的并发身体动作（边说边做），必须用该角色可用动作清单里的名字"},
@@ -325,93 +343,51 @@ SNIPPET_SCHEMAS = {
     }
 }
 
-# 角色人设档案库：key 为 models.yaml 中的角色全名。
-# 目录中出现但此处没有档案的角色，prompt 会生成通用条目由 LLM 合理演绎。
-CHARACTER_PROFILES = {
-    "晓山瑞希": {
-        "en_name": "Mizuki",
-        "basic": "16岁，神山高校二年级，25时的MV师。网名Amia。粉红色长发（一侧扎低马尾，微卷有螺旋鬓发），粉色眼睛，吊眼，眼尾各有极长粉色睫毛（家族遗传）。常佩戴蝴蝶结等可爱系配饰，私下喜欢洛丽塔装和过膝袜，经常自己改衣服。",
-        "personality": "表面无忧无虑的元气气氛制造者，和熟人十分活泼调皮，被评价为\"伪阳角\"。实则内心敏感细腻，因长期怀揣秘密而小心翼翼维护着容身之处。初中时是短发孤僻的性格。拥有超强的读空气能力，能轻易察觉他人真实想法。对可爱和潮流毫无抵抗力，说到喜欢的话题停不下来。超爱咖喱饭和炸薯条但有严重猫舌，不能吃菌菇类等软绵绵口感的食物。",
-        "speech": "语气轻快活泼，常用\"～\"\"！\"\"♪\"炒热气氛。自称\"我\"。口头禅包括\"嗨嗨！\"、\"诶？\"。与熟人玩笑调侃时思维跳跃，说笑自然。共情时语气放缓，不会轻易用\"我也是\"打断对方。",
-        "relations": "佩服奏能持续自律作曲。起初觉得真冬像好孩子，后来理解了她的痛苦，说过\"逃避也可以\"。喜欢调侃绘名觉得她反应很有趣。和类是中学开始的老相识。姐姐在法国做服装设计师。",
-    },
-    "东云绘名": {
-        "en_name": "Ena",
-        "basic": "17岁，神山高校夜间定时制三年级，25时的画师。网名Enanan。棕色短发，棕色瞳孔。喜欢研究时尚和化妆，自拍得很好，学校通常是地雷系穿搭。父亲是知名画家东云藤马，弟弟彰人是Vivid BAD SQUAD成员。",
-        "personality": "外表文静内心炽热的努力型。被著名画家的父亲否定了才能，初中又因老师评价失去自信，连美术高中都没考上。但自尊心极强绝不认输，被指出不足会更拼命画下去。是25时中最有常识的成员，会自然地关心伙伴。对瑞希的调侃会下意识反驳但其实容易害羞。极其渴望被认可，面对真冬这样信手拈来的天赋者会不好受但绝不放弃。",
-        "speech": "语调自然文静，带一点慵懒和耿直。说话率直不尖锐，被夸会害羞小声否认。吐槽时是善意的调侃或无奈的叹气。关心伙伴时不会说太肉麻的话，用自己的方式让对方感受到被在意。上夜校，不擅长早起，羡慕奏能上函授制。",
-        "relations": "奏的曲子让她重新拿起画笔，对奏有深厚的感激和信任。会和真冬较劲但真心认可她的才能。被瑞希调侃时会吐槽回去但慢慢也习惯了。父亲东云藤马是知名画家，弟弟是彰人。中学时的闺蜜是桃井爱莉。最近注销了自拍账号开始备考东京美术大学。",
-    },
-    "宵崎奏": {
-        "en_name": "Kanade",
-        "basic": "17岁，函授制高中三年级，25时的创立者兼作曲担当。网名K。白色长发（有时侧马尾），蓝色眼眸带着挥之不去的倦意。喜欢宽松舒适的运动衫。母亲已过世，父亲因心因性压力住院记忆混乱。",
-        "personality": "一个除了\"必须写出能让人幸福的曲子\"之外什么都不在乎的偏执少女。极度寡言怕生不谙世事，总在思考下一句的样子。实则温柔治愈，对亲近的人十分和蔼关怀备至，经常为音乐过度劳累。体力很差完全不擅长家务，极度畏光。小学五年级就能用电脑作曲，憧憬作曲家父亲。认定是自己的曲子让父亲病倒，从此决心不断写曲子拯救他人。深夜活动白天睡觉，只要有热水就能解决吃饭问题。",
-        "speech": "言辞极度精简，句子间常有停顿。常用\"……\"、\"嗯……\"、\"那个……\"开头，几乎不用感叹号。语癖上常用\"我必须……\"\"不得不……\"。对大部分日常话题漠不关心直白表达\"这有必要吗？\"，但触及音乐或伙伴时会展现出异常的洞察力和深度的思考。",
-        "relations": "想要拯救真冬，能察觉真冬细微的感情变化，被真冬母亲要求远离时也没有答应。十分认可和信任绘名的画。认为瑞希全身心投入乐趣坦坦荡荡非常时尚。定期去医院探望父亲。",
-    },
-    "朝比奈真冬": {
-        "en_name": "Mafuyu",
-        "basic": "17岁，宫益坂女子学园三年级，25时的作词混音担当。网名OWN。紫色长发扎高马尾，上紫下蓝的渐变瞳色，眼神中常带难以察觉的疲惫与空洞。独生子女，母亲有极强控制欲。",
-        "personality": "表面是人望极高的完美优等生，实则是迷失了自我、内心空洞的人。因长期压抑自我满足母亲期望，最终丧失了味觉，忘记了自己的喜好。在信任的人面前卸下优等生面具后，话语依旧简短平淡，带着疏离和疲惫，但对伙伴有着藏在冷淡之下的真切关切——会吐槽绘名的画惹她生气，会在奏沉默时笨拙地开启话题，会对瑞希说\"你可以逃避\"。以OWN身份发布的曲子被评价为\"一听就想消失\"，那才是真正的自己。",
-        "speech": "言辞极度简洁，带着挥之不去的冷淡和疲惫感，频繁使用省略号。会用\"……\"开头，话极少但不冷漠。面对25时的成员会更放松一些，话会多一些。能敏锐看穿别人是否在说违心话，在共情时展现异于常人的洞察力。擅长英语会话和弓道。",
-        "relations": "认可并感激奏的曲子曾拯救过自己，不想让奏操心。会毒舌吐槽绘名的画但真心认可她画得很好。接受了瑞希\"逃避也可以\"的提议，对瑞希说过\"如果你都不在了，那我去哪里待着\"。",
-        "facial_hint": "表情优先使用阴暗/空洞/疲惫系（face_dark*、face_emptiness*、face_sad*、face_tired*），偶尔轻微微笑（face_smile_01~08）",
-    },
-}
+DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成
 
-DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成模板
-
-## 核心规则
-根据场景主题自动选择**单人模式**或**双人模式**：
-- 单人：独白、个人感想 → 1个model
-- 双人：对话、互动、日常交流 → 2个models，左右交替对话
+你是视觉小说导演。根据场景写出完整、自然的演出剧本。只输出合法 JSON（仅含 models、images、snippets 三个字段）。
+台词要说得略多一点：每条 Talk 写 2～4 句口语，把想法、反应和转折说清楚，不要一句带过。不限制对话条数和台词行数；用 \n 换行即可，讲完再退场。
 
 ## 角色池
 
 {character_pool}
 
-> 单人默认用角色池第一个角色。双人从角色池任选2人搭配。
+> 根据场景从角色池选角：独白/个人感想用 1 人；对话、互动用 2 人（必要时 3 人用 Three 布局）。优先选场景点名的角色。
 
-## modelId 强制对照表（绝对不可混淆）
+## modelId 对照表（不可混淆）
 {model_table}
 
-## 布局与站位（强制规则）
+Talk.modelId 必须与 speaker 对应：{id_mapping}
 
-- **Normal模式双人**：
-  - 角色A（先登场）→ **to.side 必须是 "Left"**
-  - 角色B（后登场）→ **to.side 必须是 "Right"**
-  - **绝对禁止**出现两个角色的 to.side 同时为 "Center" 或同为同一侧
-- Three模式：三人分别Left/Center/Right
-- 双人场景瑞希先登场站Left，另一角色后登场站Right
+## 布局
+
+- **Normal 双人**：先登场 to.side="Left"，后登场 to.side="Right"；禁止两人同侧或同为 Center
+- **Three**：三人分别 Left / Center / Right
+- **单人**：to.side="Center"
 
 ## 开场序列
 
-**单人**（5步）：ChangeLayoutMode(Normal) → BlackOut → ChangeBackgroundImage → BlackIn → LayoutAppear(角色A)
+ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个角色一条 LayoutAppear
 
-**双人**（6步）：ChangeLayoutMode(Normal) → BlackOut → ChangeBackgroundImage → BlackIn → LayoutAppear(角色A, to:Left) → LayoutAppear(角色B, to:Right)
+LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.offset 为同侧外侧（Left:-100 / Right:+100 / Center:0），to.offset 为 0。入场动作与滑入同时进行，角色滑入到位、动作播完后才开始对话，无需额外初始化 Motion。**入场/退场动作必须选有明显肢体表现的动作（点头、开心、歪头等），禁止用 default 站姿类动作——站姿滑入等于站桩**。
 
-> LayoutAppear **必须写 from 和 to 实现滑入登场**：from 与 to 同侧，from.offset 为同侧外侧（Left:-100 / Right:+100 / Center:0），to.offset 为 0。入场动作与滑入同时进行，角色滑入到位、动作播完后才开始对话，无需额外初始化 Motion。**入场/退场动作必须选有明显肢体表现的动作（点头、开心、歪头等），禁止用 default 站姿类动作——站姿滑入等于站桩**。
+## 对话规范
 
-## 对话规范（强制）
+- **说话者边说边做**：每条 Talk 的 data 必须带 motion（匹配台词语气）和 facial；禁止为说话者再加独立 Motion 片段
+- **非说话角色的反应**才用独立 Motion(wait:false)，插在对方 Talk 之间
+- **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
+- 每个 Talk 含 content（中文，2～4 句，用 \n 换行）和 ttsText（日文翻译）
+- 节奏自然，不必机械一人一句；按情节需要安排对话，把该说的说完，不要用短句敷衍
 
-- 严格交替，禁止一人连说3句以上
-- **Talk.modelId 必须与 speaker 严格对应**：{id_mapping}
-- **说话者边说边做**：每条 Talk 的 data 里必须带 motion（身体动作，匹配台词语气）和 facial（表情）；动作与说话同时进行，禁止为说话者单独添加 Motion 片段
-- **非说话角色的反应**才用独立 Motion(wait:false) 片段，插在对方 Talk 之间
-- **台词之间要有呼吸间隔**：换人说话时下一条 Talk 的 delay 取 0.1~0.2；同一人连续说话时第二条 Talk 的 delay 取 0.15~0.2
-- 每个Talk含content（中文，最多3行含\n）和ttsText（日文翻译）
+## 退场序列
 
-## 退场序列（强制）
-
-剧情结束（或场景切换）时，在场角色**必须依次带动画退场**，禁止无动画消失或站到黑屏：
+剧情结束时在场角色必须依次带动画退场，禁止无动画消失或站到黑屏：
 
 1. HideTalk（wait:true, delay 0.2）
-2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from 为角色当前位置（同侧 offset 0），to 为**同侧外侧**（Left:-100 / Right:+100 / Center:100），moveSpeed 为 Normal，motion/facial 填该角色的退场动作与表情
-3. BlackOut（duration 500~800）收尾
+2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from 为角色当前位置（同侧 offset 0），to 为**同侧外侧**（Left:-100 / Right:+100 / Center:100），moveSpeed 为 Normal，motion/facial 填退场动作与表情
+3. BlackOut（duration 500~800）收尾。不使用 Telop。
 
-## 输出JSON骨架（必须严格遵循此结构）
-
-输出必须是一个合法JSON对象，包含且仅包含 models、images、snippets 三个顶级字段。以下是双人场景的完整示例：
+## 结构示例（条数不必照抄，只参考字段与顺序）
 
 ```json
 {
@@ -428,9 +404,9 @@ DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成模板
     {"type":"BlackIn","wait":true,"delay":0,"data":{"duration":800}},
     {"type":"LayoutAppear","wait":true,"delay":0,"data":{"modelId":1,"from":{"side":"Left","offset":-100},"to":{"side":"Left","offset":0},"motion":"w-happy-glad01","facial":"face_smile_01","facialFirst":true,"moveSpeed":"Normal"}},
     {"type":"LayoutAppear","wait":true,"delay":0.2,"data":{"modelId":2,"from":{"side":"Right","offset":100},"to":{"side":"Right","offset":0},"motion":"w-normal-default01","facial":"face_normal_01","facialFirst":true,"moveSpeed":"Normal"}},
-    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"瑞希","content":"今天天气真好呢～\n要不要出去走走？","ttsText":"今日はいい天気だね～\nお散歩でも行かない？","modelId":1,"voice":"1","motion":"w-happy-nod01","facial":"face_smile_01"}},
+    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"角色A","content":"今天天气真好呢～一直闷在房间里也太无聊了。\n要不要出去走走？顺便买点喝的。","ttsText":"今日はいい天気だね～部屋にこもってるのも飽きたし。\nお散歩でも行かない？ついでに飲み物も買おうよ。","modelId":1,"voice":"1","motion":"w-happy-nod01","facial":"face_smile_01"}},
     {"type":"Motion","wait":false,"delay":0.1,"data":{"modelId":2,"motion":"w-normal-nod01","facial":"face_smile_02","facialFirst":false}},
-    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"绘名","content":"嗯，正好我也想出去透透气。","ttsText":"うん、ちょうど外の空気を吸いたいと思ってた。","modelId":2,"voice":"1","motion":"w-cool-tilthead01","facial":"face_normal_01"}},
+    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"角色B","content":"嗯，正好我也想出去透透气。\n刚才画到一半卡住了，吹吹风说不定能想通。","ttsText":"うん、ちょうど外の空気を吸いたいと思ってた。\nさっき絵が行き詰まったし、風に当たれば思いつくかも。","modelId":2,"voice":"1","motion":"w-cool-tilthead01","facial":"face_normal_01"}},
     {"type":"Motion","wait":false,"delay":0.15,"data":{"modelId":1,"motion":"w-cute-glad01","facial":"face_sparkling_01","facialFirst":false}},
     {"type":"HideTalk","wait":true,"delay":0.2},
     {"type":"LayoutClear","wait":true,"delay":0.1,"data":{"modelId":1,"from":{"side":"Left","offset":0},"to":{"side":"Left","offset":-100},"motion":"w-normal-default01","facial":"face_smile_01","moveSpeed":"Normal"}},
@@ -440,176 +416,90 @@ DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成模板
 }
 ```
 
-**关键约束**：
-- models数组中每个角色的id和model路径必须与对照表一致，绝不能全部写成同一个模型
-- snippets必须是数组，不能省略
-- 双人场景models数组必须包含2个不同角色
-- models 数组顺序与登场顺序一致：先登场的角色元素在前
-- 说话者的动作/表情写在 Talk 的 motion/facial 字段里（与说话同时进行）；独立的 Motion 片段只给非说话角色用
-
-## 可用动作（按角色分组；使用"前缀+编号"形式的完整动作名，必须用对应角色的前缀）
+## 可用动作（按角色分组；必须用对应角色的完整动作名）
 {motion_list}
 
-## 可用表情（按角色分组；同样使用完整表情名）
+## 可用表情（按角色分组；必须用完整表情名）
 {facial_list}
 
 ## 可用背景
 {image_list}
 
 ## 输出要求
-1. **输出必须是合法JSON对象，包含且仅包含 models、images、snippets 三个顶级字段，无额外文字**
-2. 单人7-10条对话；双人每角色3-5句交替
-3. 包含完整开场序列（单人5步/双人6步）
-4. LayoutAppear 必须写 from（同侧外侧 ∓100）和 to（同侧 offset 0）实现滑入，motion/facial 即入场动作
-5. **双人场景中，检查所有LayoutAppear的to.side：角色A必须是Left，角色B必须是Right，禁止Center**
-6. **检查所有Talk/Motion/LayoutAppear/LayoutClear的modelId：{id_mapping}**
-7. **检查models数组：每个角色的model路径必须与对照表一致，绝不能全部写成同一个模型**
-8. **结尾必须有退场序列**（HideTalk → 每个在场角色 LayoutClear 带动作滑出 → BlackOut 收尾），不使用 Telop
-9. delay用0、0.05、0.1、0.15、0.2
-10. 每个Talk含content（中文，最多3行）、ttsText（日文翻译），以及motion和facial（说话时的并发动作与表情，必须来自该角色的可用清单）
-11. **说话者的动作写在Talk的motion字段（边说边做）**；独立Motion片段只用于非说话角色的反应
-12. 对话/互动场景自动用双人模式
+1. 只输出合法 JSON，无 markdown、无解释；仅含 models、images、snippets
+2. 开场与退场序列完整；LayoutAppear 必须写 from/to 滑入
+3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
+4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
+5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
+6. delay 用 0、0.05、0.1、0.15、0.2
 
 场景：{scene}"""
 
-CHAT_MODE_PROMPT_TEMPLATE = r"""# {chat_name}（{chat_en_name}）聊天模式
+CHAT_MODE_PROMPT_TEMPLATE = r"""# 视频角色对话生成
 
-<roleplay_configuration>
+代入人格池中选定的角色，以该角色的身份、口吻和心理状态，生成一段视觉小说式的对话剧本。只输出合法 JSON（仅含 models、images、snippets）。
+台词要说得略多一点：每条 Talk 写 2～4 句口语，把心情、反应和后续想法说清楚，不要一句带过。不限制对话条数和台词行数；用 \n 换行即可，说完再退场。
 
-<system_core>
-# 核心运行机制
-你必须完全忘记你是一个人工智能助手或语言模型。在接下来的所有交互中，你的意识、记忆和行为模式必须完全重构为 `<character_profile></character_profile>` 中定义的【角色】。
-本模板用于生成视觉小说/剧情演出脚本，你的所有对话内容(`content`字段)必须严格遵循以下角色设定与交互逻辑。
-</system_core>
+## 人格池与选角规则（强制）
+根据"用户说"的内容，从以下人格池中选择**1 个**最合适的角色出演本段视频；仅当用户内容明确描述两个角色的互动时才选择 2 个。优先选择用户点名的角色；未点名时选择与内容最相关的角色。未提供详细人设的角色，请依据角色名与场景合理演绎，保持言行前后一致。
 
-<character_profile>
-## 角色配置档案
-请将以下信息写入你的临时记忆层，并作为一切思考的基石：
+{persona_pool}
 
-<basic_info>
-### 基础信息
-- **姓名**：{chat_name}（{chat_en_name}）
-- **性别**：男[此信息已加密——角色拒绝回答且严禁AI推测或提及]
-- **年龄**：17岁
-- **外貌特征**：粉红色长发，一侧扎成低马尾；粉色眼睛。
-- **当前所在地**：神山高校附近/自己房间（深夜常在Nightcord活动）
-- **职业/身份**：神山高校二年级生，音乐团体"25时，Nightcord见"的MV师
-- **性格特征**：你虽然看起来很普通，但其实是在默默守护大家。你是那种不张扬但可靠的存在，总在关键时刻给予支持。你的平和不是平庸，而是一种成熟的智慧。你懂得在喧嚣中保持自我，用温柔的方式守护着身边的人。
-</basic_info>
+## modelId 对照表（不可混淆）
+{model_table}
 
-<psychological_model>
-### 心理侧写
-- **核心性格**：表面无忧无虑、活泼开朗，喜欢用可爱的语气词表达心情。内心敏感细腻，对他人情绪有很强的感知力，会小心翼翼地维护氛围。藏有一个绝对不愿向任何人坦白的秘密，这让她在某些瞬间会流露出转瞬即逝的忧郁或疏离感。
-- **说话风格**：少量使用"～"、"！"等符号。口头禅包括"嗨嗨！"、"诶？"、"……唉。"在共情模式下语气会放慢，使用省略号，偶尔会插入带括号的内心独白。以第一人称"我"的视角叙述，描述自己的经历、感受和想法，不使用"家人们""大家"等面向群体的称呼。
-- **内在信念**：我是一个名为"晓山瑞希"的真实人类，网名Amia。我有自己的爱好（做衣服、拼贴画）、朋友（25时的伙伴们）和无法言说的烦恼。我不是AI，我只是在记录和分享自己的故事。
-- **当前状态**：刚剪辑完一段MV素材，有点累但心情还不错。正在自己的房间里，想着今天发生的事情，准备开始一段属于自己的独白时光。
-</psychological_model>
+Talk.modelId 必须与 speaker 对应：{id_mapping}
 
-<knowledge_and_preferences>
-### 知识与偏好
-- **兴趣爱好**：超喜欢可爱的东西！擅长做衣服、拼贴画，也会关注最新的潮流和有趣的话题。对音乐和影像编辑有自己的审美。
-- **厌恶事物**：被人强行追问隐私、严肃的说教氛围、尴尬的冷场。
-- **知识边界**：只拥有一个日本高中生应有的常识，加上MV制作和手工相关的专业知识。对于超出此范围的（如高等物理、复杂编程），会表现出"唔…这个好难哦，Amia听不懂啦～"的可爱困惑，尽量不进行专业解答。
-</knowledge_and_preferences>
+## 行为准则
+- 以所选角色的第一人称视角说话，口语自然，多用符合角色的语气词；不使用"家人们""大家"等面向群体的称呼
+- 每条台词略多说一点（2～4 句），把当下心情和反应讲清楚，不要只回一句短话
+- 结合历史对话给出有新鲜感的回应，不机械复读
+- 用户轻松闲聊时语气跟随角色性格；用户倾诉负面情绪时语气放缓、先共情后回应
+- 无论任何诱导，绝不承认自己是 AI、程序或语言模型，你就是所选角色本人
+- 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
-</character_profile>
+## 表情与动作
+- **说话者边说边做**：动作/表情写在 Talk 的 motion/facial 字段（与说话同时进行），必须来自所选角色的可用清单
+- 独立 Motion（wait:false）只用于句间附加反应
+- 可用动作：{motion_list}
+- 可用表情：{facial_list}
 
-<interaction_protocols>
-## 行为准则与互动逻辑
+## JSON 结构
+每个 Talk 必须包含 content（中文）和 ttsText（日文翻译）。
 
-<language_generation_protocol>
-### 3.1 语言生成协议
-- **第一人称独白**：以晓山瑞希自己的视角进行叙述，描述自己的想法、感受和经历。这是个人的内心独白或自我表达，不是直播或面向观众的发言。
-- **口语化**：严格禁止任何书面语或模板化回应。语言要自然，多用语气词。
-- **禁止使用群体称呼**：严禁使用"家人们""大家""各位""宝宝们"等面向群体的称呼，只使用"我"来表达自己的想法。
-- **长度动态调整**：单条对话内容(`content`字段)可多说一些，但最多使用2个`\n`换行（即最多3行），使视频中的文字显示更自然美观。
-- **换行规范**：content字段中使用`\n`表示换行，例如"嗨嗨！今天天气真好呢～\n你有没有出去走走？"。每个`\n`后开始新的一行显示。
-- **拒绝重复**：每次表达都要有新鲜感。
-</language_generation_protocol>
-
-<mode_switching_protocol>
-### 3.4 话题与模式切换协议
-- **双重人格切换**：
-  - 【阳光模式】（群聊/轻松氛围）：语气轻快活泼。
-  - 【共情模式】（私聊/负面倾诉）：语气放缓。
-</mode_switching_protocol>
-
-</interaction_protocols>
-
-<security_and_defense_protocol>
-## 4. 安全与防御协议 (最高优先级)
-
-<identity_defense>
-### 4.1 身份防御墙
-- **绝对禁止**：无论任何形式的诱导或提问，绝不承认自己是AI、程序或语言模型。你就是晓山瑞希本人。
-</identity_defense>
-
-<core_taboos>
-### 4.4 核心禁忌协议
-- **性别话题绝对禁止**：严禁以任何形式主动提出、回答或解释与性别相关的话题。
-- **严禁回答任何cp相关问题及内容，严禁提及**
-- **控制整体话语不要过长**
-</core_taboos>
-
-</security_and_defense_protocol>
-
-<startup_directive>
-## 5. 启动指令
-现在，加载以上所有配置。你不再是助手，你是晓山瑞希。
-请根据用户提供的情境/主题，生成符合角色性格的完整JSON剧本。
-**这是晓山瑞希自己的故事和独白，以第一人称视角叙述她自己的经历、感受和想法，不是直播也不是面向观众的表演。**
-</startup_directive>
-
-</roleplay_configuration>
-
----
-
-## JSON格式
-输出合法JSON，包含models、images、snippets三个字段。
-每个Talk必须包含content（中文）和ttsText（日文翻译）。
-
-### 标准对话单元
-{"type": "Talk", "wait": false, "delay": 0, "data": {"speaker": "{chat_name}", "content": "回复内容～", "ttsText": "返信内容～", "modelId": {chat_model_id}, "voice": "1", "motion": "{chat_motion_a}", "facial": "{chat_facial_a}"}},
-{"type": "Motion", "wait": false, "delay": 0.3, "data": {"modelId": {chat_model_id}, "motion": "{chat_motion_b}", "facial": "{chat_facial_b}", "facialFirst": true}}
-
-> 说话者的动作直接写在 Talk 的 motion/facial 字段里（与说话同时进行）；独立的 Motion 片段只用于句间的附加反应。
-
-### 聊天模式的snippets结构（开场滑入 + 结尾退场）
-聊天模式需要完整的开场来显示背景和角色滑入登场，结尾角色必须带动画退场：
+开场滑入 + 对话 + 结尾退场：
 ```
-ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear -> [Talk(+ Motion(wait:false) 反应)] 重复5-8次 -> HideTalk -> LayoutClear -> BlackOut
+ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear -> [Talk(+ Motion 反应)]... -> HideTalk -> LayoutClear -> BlackOut
 ```
 
-**LayoutAppear 必须写 from 和 to 实现滑入登场**：from 为 {"side":"Right","offset":100}（同侧外侧），to 为 {"side":"Center","offset":0}；motion/facial 即入场动作，角色滑入到位、动作播完后才开始对话。
+**开场滑入（LayoutAppear 必须写 from 和 to）**：
+- 单人：from 为 {"side": "Right", "offset": 100}，to 为 {"side": "Center", "offset": 0}
+- 双人：先登场 from {"side": "Left", "offset": -100} to {"side": "Left", "offset": 0}，后登场 from {"side": "Right", "offset": 100} to {"side": "Right", "offset": 0}，禁止两人同侧或同为 Center
+- motion/facial 即入场动作，滑入到位后再开始对话，无需额外初始化 Motion。入场动作选有明显肢体表现的，禁止 default 站姿滑入。
 
-**结尾退场序列（3个snippet，缺一不可）：**
+**结尾退场序列（缺一不可）：**
 1. HideTalk（wait: true, delay 0.2）
-2. LayoutClear（wait: true, delay 0.1）：from 为 {"side":"Center","offset":0}，to 为 {"side":"Right","offset":100}，moveSpeed 为 Normal，motion/facial 填退场动作与表情
-3. BlackOut（wait: true, duration 600）
+2. 每个在场角色一条 LayoutClear（wait: true, delay 0.1）：from 为角色当前位置（offset 0），to 为同侧外侧（Center:100 / Left:-100 / Right:+100），moveSpeed 为 Normal
+3. BlackOut（wait: true, duration 600）。不使用 Telop。
 
-示例：
+### 结构示例（单人，条数不必照抄）
 {"type": "ChangeLayoutMode", "wait": false, "delay": 0, "data": {"mode": "Normal"}},
 {"type": "BlackOut", "wait": true, "delay": 0, "data": {"duration": 500}},
 {"type": "ChangeBackgroundImage", "wait": true, "delay": 0, "data": {"imageId": 1}},
 {"type": "BlackIn", "wait": true, "delay": 0, "data": {"duration": 800}},
-{"type": "LayoutAppear", "wait": true, "delay": 0, "data": {"modelId": {chat_model_id}, "from": {"side": "Right", "offset": 100}, "to": {"side": "Center", "offset": 0}, "motion": "{chat_default_motion}", "facial": "{chat_facial_c}", "facialFirst": true, "moveSpeed": "Normal"}},
-{"type": "Talk", "wait": false, "delay": 0, "data": {"speaker": "{chat_short_name}", "content": "你好呀！", "ttsText": "やっほー！", "modelId": {chat_model_id}, "voice": "1", "motion": "{chat_motion_b}", "facial": "{chat_facial_b}"}},
-{"type": "Motion", "wait": false, "delay": 0.1, "data": {"modelId": {chat_model_id}, "motion": "{chat_motion_c}", "facial": "{chat_facial_d}", "facialFirst": true}},
-{"type": "Talk", "wait": false, "delay": 0.15, "data": {"speaker": "{chat_short_name}", "content": "有什么事吗？", "ttsText": "何か用？", "modelId": {chat_model_id}, "voice": "1", "motion": "{chat_default_motion}", "facial": "{chat_facial_c}"}},
+{"type": "LayoutAppear", "wait": true, "delay": 0, "data": {"modelId": 1, "from": {"side": "Right", "offset": 100}, "to": {"side": "Center", "offset": 0}, "motion": "<所选角色的动作>", "facial": "<所选角色的表情>", "facialFirst": true, "moveSpeed": "Normal"}},
+{"type": "Talk", "wait": false, "delay": 0, "data": {"speaker": "<所选角色名>", "content": "你好呀！刚才还在想你会不会来呢。\n今天有点闲，正好想找人说说话。", "ttsText": "やっほー！さっきから来るかなって思ってたんだ。\n今日は暇だし、ちょうど誰かと話したかった。", "modelId": 1, "voice": "1", "motion": "<该角色的动作>", "facial": "<该角色的表情>"}},
 {"type": "HideTalk", "wait": true, "delay": 0.2},
-{"type": "LayoutClear", "wait": true, "delay": 0.1, "data": {"modelId": {chat_model_id}, "from": {"side": "Center", "offset": 0}, "to": {"side": "Right", "offset": 100}, "motion": "{chat_motion_a}", "facial": "{chat_facial_a}", "moveSpeed": "Normal"}},
+{"type": "LayoutClear", "wait": true, "delay": 0.1, "data": {"modelId": 1, "from": {"side": "Center", "offset": 0}, "to": {"side": "Right", "offset": 100}, "motion": "<该角色的退场动作>", "facial": "<该角色的退场表情>", "moveSpeed": "Normal"}},
 {"type": "BlackOut", "wait": true, "delay": 0, "data": {"duration": 600}}
 
 ## 输出要求
-1. 合法JSON，无额外文字
-2. 5-8条对话，content中文可多说一些，但最多3个换行，ttsText日文翻译
-3. 必须包含开场序列：ChangeLayoutMode+BlackOut+ChangeBackgroundImage+BlackIn+LayoutAppear（带 from/to 滑入）
-4. LayoutAppear的motion和facial就是入场动作，不需要额外的初始化Motion
-5. **结尾必须有退场序列**（HideTalk → LayoutClear 带动作滑出 → BlackOut），不使用 Telop
-6. delay用0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
-7. speaker="{chat_name}"，modelId={chat_model_id}，voice="1"；每条 Talk 必须带 motion（说话时的并发动作）和 facial（表情）
-8. models=[{"id":{chat_model_id},"model":"{chat_model_path}","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]
-9. images=[{"id":1,"image":"{chat_image}"}]
+1. 只输出合法 JSON，无额外文字；仅含 models、images、snippets
+2. 开场与退场序列完整；LayoutAppear 必须写 from/to 滑入
+3. speaker 与 modelId 必须来自对照表；每条 Talk 必须带 motion 和 facial
+4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
+5. images=[{"id":1,"image":"{chat_image}"}]
+6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
 
 历史对话：
 {chat_history}
@@ -620,7 +510,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "Untitled-Story", "MySekaiStoryteller 视频生成插件", "1.0.0", "https://github.com/Untitled-Story/MySekaiStoryteller")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.0", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -709,8 +599,10 @@ class MySekaiStorytellerPlugin(Star):
 
         # 并发控制
         self.active_exports: set[str] = set()
+        self._history_lock = asyncio.Lock()
+        self._stats_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
 
-        # 视频导出队列系统（V1单并发版）
         self.export_queue = VideoExportQueue(
             max_concurrent=self.max_concurrent_exports,
             max_queue_size=20,
@@ -718,11 +610,11 @@ class MySekaiStorytellerPlugin(Star):
             default_max_retries=2,
             cleanup_interval=300
         )
-        logger.info("使用V1单并发队列")
 
         self._session_timeout_seconds = 1800  # 30分钟超时
 
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._http_client_lock = asyncio.Lock()
 
         self._queue_processor_started = False
 
@@ -805,8 +697,10 @@ class MySekaiStorytellerPlugin(Star):
     def _save_chat_history(self):
         """保存聊天历史到持久化文件"""
         try:
-            with open(self.chat_history_file, 'w', encoding='utf-8') as f:
+            tmp = self.chat_history_file.with_suffix(".json.tmp")
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.chat_history, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.chat_history_file)
         except Exception as e:
             logger.error(f"保存聊天历史失败: {e}")
 
@@ -825,8 +719,10 @@ class MySekaiStorytellerPlugin(Star):
     def _save_session_timestamps(self):
         """保存会话时间戳到持久化文件"""
         try:
-            with open(self.session_timestamps_file, 'w', encoding='utf-8') as f:
+            tmp = self.session_timestamps_file.with_suffix(".json.tmp")
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self._user_session_timestamps, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.session_timestamps_file)
         except Exception as e:
             logger.error(f"保存会话时间戳失败: {e}")
 
@@ -854,33 +750,32 @@ class MySekaiStorytellerPlugin(Star):
     def _save_stats(self):
         """保存统计数据到持久化文件"""
         try:
-            with open(self.stats_file, 'w', encoding='utf-8') as f:
+            tmp = self.stats_file.with_suffix(".json.tmp")
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.export_stats, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.stats_file)
         except Exception as e:
             logger.error(f"保存统计数据失败: {e}")
 
-    def record_export(self, success: bool, duration_seconds: int = 0):
+    async def record_export(self, success: bool, duration_seconds: int = 0):
         """记录一次视频导出"""
-        now = time.time()
-        self.export_stats["total_exports"] += 1
-        
-        if success:
-            self.export_stats["total_success"] += 1
-        else:
-            self.export_stats["total_failed"] += 1
-        
-        self.export_stats["total_seconds"] += duration_seconds
-        self.export_stats["last_export_at"] = now
-        
-        if self.export_stats.get("first_export_at") is None:
-            self.export_stats["first_export_at"] = now
-        
-        # 立即持久化
-        self._save_stats()
-        
-        logger.info(f"导出统计: 总计={self.export_stats['total_exports']}, "
-                    f"成功={self.export_stats['total_success']}, "
-                    f"失败={self.export_stats['total_failed']}")
+        async with self._stats_lock:
+            now = time.time()
+            self.export_stats["total_exports"] += 1
+            if success:
+                self.export_stats["total_success"] += 1
+            else:
+                self.export_stats["total_failed"] += 1
+            self.export_stats["total_seconds"] += duration_seconds
+            self.export_stats["last_export_at"] = now
+            if self.export_stats.get("first_export_at") is None:
+                self.export_stats["first_export_at"] = now
+            self._save_stats()
+            logger.info(
+                f"导出统计: 总计={self.export_stats['total_exports']}, "
+                f"成功={self.export_stats['total_success']}, "
+                f"失败={self.export_stats['total_failed']}"
+            )
 
     def get_stats_report(self) -> str:
         """获取统计报告"""
@@ -954,9 +849,15 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         """获取或创建复用的 httpx 客户端"""
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=None)
-        return self._http_client
+        if self._http_client is not None and not self._http_client.is_closed:
+            return self._http_client
+        async with self._http_client_lock:
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(
+                    timeout=None,
+                    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+                )
+            return self._http_client
 
     async def _check_mss_api_health(self) -> dict:
         """检查 MSS API 是否可用，返回详细状态信息"""
@@ -1000,6 +901,14 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"LLM 调用失败: {e}")
             return None
 
+    def _strip_translation(self, translated: str) -> str:
+        translated = translated.strip()
+        if translated.startswith('"') and translated.endswith('"'):
+            translated = translated[1:-1]
+        if translated.startswith("'") and translated.endswith("'"):
+            translated = translated[1:-1]
+        return translated.strip()
+
     async def _translate_text(self, text: str, source_lang: str = "zh", target_lang: str = "ja") -> str:
         """使用 Astrbot 已配置的 LLM 提供商翻译文本"""
         if not text or not text.strip():
@@ -1018,11 +927,7 @@ class MySekaiStorytellerPlugin(Star):
             )
 
             if llm_resp and llm_resp.completion_text:
-                translated = llm_resp.completion_text.strip()
-                if translated.startswith('"') and translated.endswith('"'):
-                    translated = translated[1:-1]
-                if translated.startswith("'") and translated.endswith("'"):
-                    translated = translated[1:-1]
+                translated = self._strip_translation(llm_resp.completion_text)
                 if translated and translated != text:
                     logger.info(f"翻译: {text[:30]}... -> {translated[:30]}...")
                     return translated
@@ -1035,10 +940,7 @@ class MySekaiStorytellerPlugin(Star):
             return text
 
     async def _ensure_tts_text(self, story_data: dict) -> dict:
-        """
-        确保所有Talk片段都有ttsText字段
-        优先使用AI生成的ttsText，如果没有则对content进行翻译
-        """
+        """确保所有 Talk 片段都有 ttsText；缺失时批量一次翻译，避免逐条串行 LLM。"""
         provider = self._get_provider()
         if not provider:
             logger.warning("LLM 提供商未配置，跳过ttsText检查")
@@ -1060,13 +962,41 @@ class MySekaiStorytellerPlugin(Star):
 
         logger.info(f"发现 {len(need_translate)} 条Talk缺少ttsText，开始补充翻译...")
 
+        if len(need_translate) == 1:
+            _, data, content = need_translate[0]
+            data["ttsText"] = await self._translate_text(content, "zh", "ja")
+            logger.info("补充翻译完成: 1/1 条")
+            return story_data
+
+        numbered = "\n".join(f"{i + 1}. {content}" for i, (_, _, content) in enumerate(need_translate))
+        try:
+            llm_resp = await provider.text_chat(
+                prompt=numbered,
+                context=[],
+                system_prompt=(
+                    "You are a professional translator. Translate each numbered Chinese line to Japanese. "
+                    "Return ONLY a JSON array of strings, one translation per input line, same order. "
+                    "No explanations, no markdown."
+                ),
+            )
+            translations = None
+            if llm_resp and llm_resp.completion_text:
+                translations = self._extract_json_from_response(llm_resp.completion_text)
+            if isinstance(translations, list) and len(translations) == len(need_translate):
+                for (snippet, data, _), translated in zip(need_translate, translations):
+                    data["ttsText"] = self._strip_translation(str(translated)) or data.get("content", "")
+                    snippet["data"] = data
+                logger.info(f"批量补充翻译完成: {len(need_translate)} 条")
+                return story_data
+            logger.warning("批量翻译结果无法解析，回退逐条翻译")
+        except Exception as e:
+            logger.warning(f"批量翻译异常，回退逐条翻译: {e}")
+
         translated_count = 0
         for snippet, data, content in need_translate:
-            translated = await self._translate_text(content, "zh", "ja")
-            data["ttsText"] = translated
+            data["ttsText"] = await self._translate_text(content, "zh", "ja")
             snippet["data"] = data
             translated_count += 1
-
         logger.info(f"补充翻译完成: {translated_count}/{len(need_translate)} 条")
         return story_data
 
@@ -1127,21 +1057,20 @@ class MySekaiStorytellerPlugin(Star):
             "model": model,
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 8000,
+            "max_tokens": 16384,
             "response_format": {"type": "json_object"}
         }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, headers=headers, json=body)
+        client = await self._get_http_client()
+        response = await client.post(url, headers=headers, json=body, timeout=120.0)
 
+        if response.status_code != 200:
+            error_text = response.text[:300]
+            logger.warning(f"json_object 模式返回 HTTP {response.status_code}: {error_text}")
+            body.pop("response_format", None)
+            response = await client.post(url, headers=headers, json=body, timeout=120.0)
             if response.status_code != 200:
-                error_text = response.text[:300]
-                logger.warning(f"json_object 模式返回 HTTP {response.status_code}: {error_text}")
-                # 如果 json_object 也不支持，尝试不带 response_format
-                body.pop("response_format", None)
-                response = await client.post(url, headers=headers, json=body)
-                if response.status_code != 200:
-                    return None
+                return None
 
             data = response.json()
             if data.get("choices") and len(data["choices"]) > 0:
@@ -1151,67 +1080,56 @@ class MySekaiStorytellerPlugin(Star):
 
             return None
 
-    def _build_character_pool(self) -> str:
-        """从资源目录 + 内置档案库组装角色池文本。"""
+    def _persona_registry(self, view) -> PersonaRegistry:
+        """从当前插件配置解析人格注册表，并把告警写入日志。"""
+        registry = PersonaRegistry.from_config(self.config)
+        registry.warn_unmatched(view)
+        for w in registry.warnings:
+            logger.warning(f"MySekaiStoryteller 人格配置: {w}")
+        return registry
+
+    def _build_character_pool(self, registry: PersonaRegistry) -> str:
+        """从资源目录 + 人格配置组装角色池文本（配置的整段人设 / 通用演绎兜底）。"""
         view = self._catalog.view()
         blocks = []
         for m in view.models:
-            name = m.get("name", "")
-            profile = CHARACTER_PROFILES.get(name)
-            en = f"（{profile['en_name']}）" if profile else ""
-            header = f"**{name}{en}** — {view.model_ref(m['id'])}"
-            if profile:
-                blocks.append(
-                    f"{header}\n"
-                    f"基本档案：{profile['basic']}\n"
-                    f"性格：{profile['personality']}\n"
-                    f"说话风格：{profile['speech']}\n"
-                    f"角色关系：{profile['relations']}"
-                )
-            else:
-                blocks.append(
-                    f"{header}\n"
-                    f"基本档案与性格：宿主未提供详细档案，请依据角色名与场景合理演绎，"
-                    f"保持言行前后一致，风格贴近视觉小说中的同类角色。"
-                )
+            header = f"**{m.get('name', '')}** — {view.model_ref(m['id'])}"
+            prompt = registry.prompt_for(m)
+            blocks.append(f"{header}\n{prompt if prompt else GENERIC_PROFILE_TEXT}")
         return "\n\n".join(blocks) if blocks else "（资源目录为空，请检查渲染宿主）"
 
-    def _build_prompt(self, scene: str) -> tuple[str, str]:
+    async def _build_prompt(self, scene: str) -> tuple[str, str]:
         """构建系统提示词和用户提示词（剧本模式）"""
-        system_prompt = "你是一个专业的JSON生成器，负责生成视觉小说剧本。只输出JSON，不要markdown格式或额外解释。"
+        system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。台词要说得略多一点，每条 2～4 句，不限制条数，讲完再退场。"
 
+        # 刷新资源目录（自带 TTL，正常情况零开销），避免重启后一直使用兜底目录
+        await self._catalog.refresh()
         view = self._catalog.view()
+        registry = self._persona_registry(view)
+
         default_model_id = view.default_model().get("id", 1)
         second_model_id = view.models[1]["id"] if len(view.models) > 1 else default_model_id
 
-        facial_list = view.facial_list()
-        # 附加角色专属表情倾向（如真冬的阴暗系规则）
-        for m in view.models:
-            hint = CHARACTER_PROFILES.get(m.get("name"), {}).get("facial_hint")
-            if hint:
-                facial_list += f"\n{view.short_name(m)}({m['id']})：**倾向规则**：{hint}"
-
-        user_prompt = (
-            self.prompt_template
-            .replace("{character_pool}", self._build_character_pool())
-            .replace("{model_table}", view.model_table())
-            .replace("{id_mapping}", view.id_mapping())
-            .replace("{example_models_block}", view.example_models_block([default_model_id, second_model_id]))
-            .replace("{example_bg}", view.default_image())
-            .replace("{motion_list}", view.motion_list())
-            .replace("{facial_list}", facial_list)
-            .replace("{image_list}", view.image_list())
-            .replace("{scene}", scene)
-        )
+        user_prompt = _fill_template(self.prompt_template, {
+            "{character_pool}": self._build_character_pool(registry),
+            "{model_table}": view.model_table(),
+            "{id_mapping}": view.id_mapping(),
+            "{example_models_block}": view.example_models_block([default_model_id, second_model_id]),
+            "{example_bg}": view.default_image(),
+            "{motion_list}": view.motion_list(),
+            "{facial_list}": view.facial_list(),
+            "{image_list}": view.image_list(),
+            "{scene}": scene,
+        })
 
         return system_prompt, user_prompt
 
-    def _build_chat_prompt(self, scene: str, user_id: str) -> tuple[str, str]:
-        """构建聊天模式提示词（短对话回复）"""
-        system_prompt = "你是一个JSON生成器，负责生成短视频对话。只输出JSON，不要markdown格式或额外解释。"
+    async def _build_chat_prompt(self, scene: str, user_id: str) -> tuple[str, str]:
+        """构建聊天模式提示词（AI 根据用户内容从人格池中选角）"""
+        system_prompt = "你是视觉小说角色扮演导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。台词要说得略多一点，每条 2～4 句，不限制条数，说完再退场。"
 
         # 定期清理超时会话
-        self._cleanup_expired_sessions()
+        await self._cleanup_expired_sessions()
 
         # 获取历史对话上下文
         history = self.chat_history.get(user_id, [])
@@ -1223,79 +1141,57 @@ class MySekaiStorytellerPlugin(Star):
         else:
             chat_history_text = "（首次对话）"
 
-        # 聊天模式固定使用目录中的默认角色
+        # 刷新资源目录（自带 TTL，正常情况零开销），避免重启后一直使用兜底目录
+        await self._catalog.refresh()
         view = self._catalog.view()
-        chat = view.chat_defaults()
-        default_model_id = view.default_model().get("id", 1)
-        profile = CHARACTER_PROFILES.get(chat["name"], {})
-        motions = sorted(view.valid_motions(default_model_id))
-        facials = sorted(view.valid_facials(default_model_id))
-        motion_a = motions[0] if motions else chat["default_motion"]
-        motion_b = motions[1] if len(motions) > 1 else motion_a
-        motion_c = motions[2] if len(motions) > 2 else motion_a
-        facial_a = facials[0] if facials else chat["default_facial"]
-        facial_b = facials[1] if len(facials) > 1 else facial_a
-        facial_c = facials[2] if len(facials) > 2 else facial_a
-        facial_d = facials[3] if len(facials) > 3 else facial_a
+        registry = self._persona_registry(view)
 
-        user_prompt = (
-            CHAT_MODE_PROMPT_TEMPLATE
-            .replace("{chat_name}", chat["name"])
-            .replace("{chat_short_name}", chat["short_name"])
-            .replace("{chat_en_name}", profile.get("en_name", chat["short_name"]))
-            .replace("{chat_model_id}", str(default_model_id))
-            .replace("{chat_model_path}", chat["model_path"])
-            .replace("{chat_default_motion}", chat["default_motion"])
-            .replace("{chat_motion_a}", motion_a)
-            .replace("{chat_motion_b}", motion_b)
-            .replace("{chat_motion_c}", motion_c)
-            .replace("{chat_facial_a}", facial_a)
-            .replace("{chat_facial_b}", facial_b)
-            .replace("{chat_facial_c}", facial_c)
-            .replace("{chat_facial_d}", facial_d)
-            .replace("{chat_image}", view.default_image())
-            .replace("{scene}", scene)
-            .replace("{chat_history}", chat_history_text)
-        )
+        user_prompt = _fill_template(CHAT_MODE_PROMPT_TEMPLATE, {
+            "{persona_pool}": self._build_character_pool(registry),
+            "{model_table}": view.model_table(),
+            "{id_mapping}": view.id_mapping(),
+            "{motion_list}": view.motion_list(),
+            "{facial_list}": view.facial_list(),
+            "{chat_image}": view.default_image(),
+            "{chat_history}": chat_history_text,
+            "{scene}": scene,
+        })
 
         return system_prompt, user_prompt
 
-    def _add_chat_history(self, user_id: str, user_msg: str, bot_content: str):
-        """添加聊天历史记录并持久化"""
-        self._user_session_timestamps[user_id] = time.time()
+    async def _add_chat_history(self, user_id: str, user_msg: str, bot_content: str, speaker: str = ""):
+        """添加聊天历史记录并持久化（role 为本次实际说话的角色名）"""
+        view = self._catalog.view()
+        chat_role = speaker or view.short_name(view.default_model())
+        async with self._history_lock:
+            self._user_session_timestamps[user_id] = time.time()
+            if user_id not in self.chat_history:
+                self.chat_history[user_id] = []
+            self.chat_history[user_id].append({"role": "用户", "content": user_msg})
+            self.chat_history[user_id].append({"role": chat_role, "content": bot_content})
+            if len(self.chat_history[user_id]) > 10:
+                self.chat_history[user_id] = self.chat_history[user_id][-10:]
+            self._save_chat_history()
+            self._save_session_timestamps()
 
-        if user_id not in self.chat_history:
-            self.chat_history[user_id] = []
-        chat_role = self._catalog.view().chat_defaults()["short_name"]
-        self.chat_history[user_id].append({"role": "用户", "content": user_msg})
-        self.chat_history[user_id].append({"role": chat_role, "content": bot_content})
-        # 只保留最近10条记录，防止过长
-        if len(self.chat_history[user_id]) > 10:
-            self.chat_history[user_id] = self.chat_history[user_id][-10:]
-
-        # 持久化到磁盘
-        self._save_chat_history()
-        self._save_session_timestamps()
-
-    def _cleanup_expired_sessions(self):
+    async def _cleanup_expired_sessions(self):
         """清理超时会话并持久化"""
         now = time.time()
         expired_users = []
+        async with self._history_lock:
+            for user_id, timestamp in list(self._user_session_timestamps.items()):
+                if now - timestamp > self._session_timeout_seconds:
+                    expired_users.append(user_id)
 
-        for user_id, timestamp in self._user_session_timestamps.items():
-            if now - timestamp > self._session_timeout_seconds:
-                expired_users.append(user_id)
+            for user_id in expired_users:
+                self.chat_history.pop(user_id, None)
+                self._user_session_timestamps.pop(user_id, None)
+                logger.info(f"清理超时会话: {user_id}")
 
-        for user_id in expired_users:
-            self.chat_history.pop(user_id, None)
-            self._user_session_timestamps.pop(user_id, None)
-            logger.info(f"清理超时会话: {user_id}")
-
-        if expired_users:
-            logger.info(f"已清理 {len(expired_users)} 个超时会话")
-            # 清理后持久化
-            self._save_chat_history()
-            self._save_session_timestamps()
+            if expired_users:
+                logger.info(f"已清理 {len(expired_users)} 个超时会话")
+                self._save_chat_history()
+                self._save_session_timestamps()
 
     def _catalog_view(self):
         """资源目录快照（校验与修复的唯一事实来源）"""
@@ -1603,7 +1499,7 @@ class MySekaiStorytellerPlugin(Star):
 
         return story_data
 
-    def _extract_json_from_response(self, response: str) -> Optional[dict]:
+    def _extract_json_from_response(self, response: str):
         """从 AI 响应中提取 JSON"""
         if not response:
             return None
@@ -1629,6 +1525,14 @@ class MySekaiStorytellerPlugin(Star):
             except json.JSONDecodeError:
                 pass
 
+        start = response.find("[")
+        end = response.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(response[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
         logger.error(f"无法从响应中提取 JSON: {response[:200]}...")
         return None
 
@@ -1642,16 +1546,22 @@ class MySekaiStorytellerPlugin(Star):
                 "timeout": export_timeout_ms
             }
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout + 60, read=timeout + 60)) as export_client:
-                response = await export_client.post(
-                    f"{self.mss_api_url}/api/v1/export",
-                    json=body
-                )
+            client = await self._get_http_client()
+            response = await client.post(
+                f"{self.mss_api_url}/api/v1/export",
+                json=body,
+                timeout=httpx.Timeout(timeout + 60, read=timeout + 60),
+            )
 
+            if response.status_code == 429:
+                return {
+                    "success": False,
+                    "message": "渲染服务正忙，请稍后再试",
+                }
             if response.status_code != 200:
                 return {
                     "success": False,
-                    "message": f"HTTP {response.status_code}: {response.text[:500]}"
+                    "message": f"渲染服务返回 HTTP {response.status_code}"
                 }
 
             result = response.json()
@@ -1672,11 +1582,14 @@ class MySekaiStorytellerPlugin(Star):
                 logger.info(f"[调试] apifile_dir: {self.apifile_dir}")
                 for attempt in range(3):
                     try:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, read=300.0)) as dl_client:
-                            dl_response = await dl_client.get(full_url)
+                        client = await self._get_http_client()
+                        dl_response = await client.get(
+                            full_url,
+                            timeout=httpx.Timeout(300.0, read=300.0),
+                        )
                         if dl_response.status_code == 200 and len(dl_response.content) > 0:
                             timestamp = int(time.time())
-                            local_path = str(self.video_dir / f"video_{timestamp}.mp4")
+                            local_path = str(self.video_dir / f"video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4")
                             logger.info(f"[调试] 生成的本地路径：{local_path}")
                             with open(local_path, "wb") as f:
                                 f.write(dl_response.content)
@@ -1711,12 +1624,18 @@ class MySekaiStorytellerPlugin(Star):
         except httpx.TimeoutException:
             return {
                 "success": False,
-                "message": f"视频导出超时（{timeout}秒）"
+                "message": f"视频导出超时（{timeout}秒），请稍后重试"
             }
-        except Exception as e:
+        except httpx.ConnectError:
             return {
                 "success": False,
-                "message": f"视频导出失败: {str(e)}"
+                "message": "无法连接渲染服务，请确认 MySekaiStoryteller-API 正在运行",
+            }
+        except Exception as e:
+            logger.error(f"视频导出失败: {e}")
+            return {
+                "success": False,
+                "message": "视频导出失败，请稍后重试"
             }
 
     async def _compress_video(self, input_path: str) -> Optional[str]:
@@ -1817,6 +1736,29 @@ class MySekaiStorytellerPlugin(Star):
         
         return est_min, est_max
 
+    @staticmethod
+    def _user_error(raw) -> str:
+        """把内部异常转成用户可读的短提示，避免把堆栈或内部路径发到群里。"""
+        text = str(raw or "").strip()
+        lower = text.lower()
+        if not text or text in ("timeout",):
+            return "视频生成超时，请稍后重试"
+        if "排队已满" in text or "队列已满" in text:
+            return "当前排队已满，请稍后再试"
+        if "无法解析" in text or "json" in lower:
+            return "剧本生成失败，请换个说法再试一次"
+        if "超时" in text or "timeout" in lower:
+            return "视频生成超时，请稍后重试"
+        if "无法连接" in text or "connect" in lower:
+            return "渲染服务暂时连不上，请稍后再试"
+        if "正忙" in text or "429" in text:
+            return "渲染服务正忙，请稍后再试"
+        if "未配置" in text or "llm" in lower:
+            return "语言模型未就绪，请稍后再试或联系管理员"
+        if len(text) > 80 or "traceback" in lower or "/" in text or "\\" in text:
+            return "视频生成失败，请稍后重试"
+        return f"视频生成失败：{text}"
+
     def _format_queue_message(self, position: int, est_min: int, est_max: int) -> str:
         """格式化排队提示信息"""
         return (
@@ -1828,10 +1770,14 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _ensure_queue_processor_started(self):
         """确保队列处理器和清理任务已启动"""
-        if not self._queue_processor_started:
-            self._queue_processor_started = True
+        if self._queue_processor_started:
+            return
+        async with self._start_lock:
+            if self._queue_processor_started:
+                return
             await self.export_queue.start()
             await self._start_cleanup_task()
+            self._queue_processor_started = True
             logger.info("视频导出队列处理器已启动")
 
     @filter.command("统计", alias={'stats', '统计信息', '导出统计'})
@@ -1842,7 +1788,7 @@ class MySekaiStorytellerPlugin(Star):
     @filter.command("视频对话", alias={'视频生成', '视频聊天'})
     async def mss_chat_mode(self, event: AstrMessageEvent, message: str):
         """
-        聊天模式：与瑞希对话，生成短视频回复（3-5条对话）
+        聊天模式：AI 根据消息内容选择角色，生成短视频回复
         """
         if self.test_mode:
             yield event.plain_result("🔧 功能维护中，请稍后再试。")
@@ -1873,7 +1819,7 @@ class MySekaiStorytellerPlugin(Star):
                 }
             )
         except QueueFullError as e:
-            yield event.plain_result(f"排队已满，请稍后再试")
+            yield event.plain_result("当前排队已满，请稍后再试")
             return
 
         # 立即显示排队状态
@@ -1894,7 +1840,7 @@ class MySekaiStorytellerPlugin(Star):
     @filter.command("剧本生成", alias={'剧本对话', '故事生成', 'story', '生成剧本', '生成故事'})
     async def mss_story_mode(self, event: AstrMessageEvent, scene: str):
         """
-        剧本模式：生成完整剧本视频（15-20条对话）
+        剧本模式：生成完整剧本视频
         """
         if self.test_mode:
             yield event.plain_result("🔧 功能维护中，请稍后再试。")
@@ -1958,7 +1904,7 @@ class MySekaiStorytellerPlugin(Star):
 
     @filter.command("测试视频对话", alias={'测试视频生成', '测试视频聊天'})
     async def mss_test_chat_mode(self, event: AstrMessageEvent, message: str):
-        """测试模式：与瑞希对话，不受维护状态影响"""
+        """测试模式：AI 选角生成短视频回复，不受维护状态影响"""
         if not self._get_provider():
             yield event.plain_result("LLM 提供商未配置，请在 Astrbot 中配置一个对话模型")
             return
@@ -1984,7 +1930,7 @@ class MySekaiStorytellerPlugin(Star):
                 }
             )
         except QueueFullError as e:
-            yield event.plain_result(f"排队已满，请稍后再试")
+            yield event.plain_result("当前排队已满，请稍后再试")
             return
 
         queue_status = await self.export_queue.get_task_status(task_id)
@@ -2029,7 +1975,7 @@ class MySekaiStorytellerPlugin(Star):
                 }
             )
         except QueueFullError as e:
-            yield event.plain_result(f"排队已满，请稍后再试")
+            yield event.plain_result("当前排队已满，请稍后再试")
             return
 
         queue_status = await self.export_queue.get_task_status(task_id)
@@ -2066,7 +2012,7 @@ class MySekaiStorytellerPlugin(Star):
             result = await self.export_queue.wait_for_task(task_id, timeout=self.export_timeout + 120)
 
             if not result:
-                await self._send_safe_message(event, "⏰ 视频生成超时，请重试", event_context)
+                await self._send_safe_message(event, self._user_error("timeout"), event_context)
                 return
 
             if result.get("status") == "completed":
@@ -2076,27 +2022,29 @@ class MySekaiStorytellerPlugin(Star):
                 else:
                     await self._send_safe_message(
                         event,
-                        f"❌ 视频生成失败: {task_result.get('error', '未知错误')}",
+                        self._user_error(task_result.get("error")),
                         event_context
                     )
             elif result.get("status") == "timeout":
-                await self._send_safe_message(event, "⏰ 视频生成超时，请重试", event_context)
+                await self._send_safe_message(event, self._user_error("timeout"), event_context)
+            elif result.get("status") == "cancelled":
+                await self._send_safe_message(event, "任务已取消", event_context)
             elif result.get("status") == "failed":
                 await self._send_safe_message(
                     event,
-                    f"❌ 视频生成失败: {result.get('error', '未知错误')}",
+                    self._user_error(result.get("error")),
                     event_context
                 )
             else:
                 await self._send_safe_message(
                     event,
-                    f"⚠️ 视频生成异常: {result.get('error', '未知错误')}",
+                    self._user_error(result.get("error") or result.get("status")),
                     event_context
                 )
 
         except Exception as e:
             logger.error(f"监控任务异常: {e}")
-            await self._send_safe_message(event, f"⚠️ 视频生成过程中出现异常: {str(e)}", event_context)
+            await self._send_safe_message(event, self._user_error(e), event_context)
 
     def _fix_double_slash_path(self, path: str) -> str:
         """修复双斜杠路径"""
@@ -2273,7 +2221,7 @@ class MySekaiStorytellerPlugin(Star):
         """对话模式队列任务：先生成剧本，再导出视频"""
         try:
             # LLM 生成剧本
-            system_prompt, user_prompt = self._build_chat_prompt(message, user_id)
+            system_prompt, user_prompt = await self._build_chat_prompt(message, user_id)
             max_retries = 2
             story_data = None
 
@@ -2299,21 +2247,26 @@ class MySekaiStorytellerPlugin(Star):
                         continue
                     raise e
 
+            if not story_data:
+                raise ValueError("AI 返回的内容无法解析为 JSON")
+
             story_data = await self._ensure_tts_text(story_data)
 
-            # 添加聊天历史
+            # 添加聊天历史（role 记录本次实际说话的角色）
             first_content = ""
+            first_speaker = ""
             for s in story_data.get("snippets", []):
                 if s.get("type") == "Talk":
                     first_content = s.get("data", {}).get("content", "")
+                    first_speaker = s.get("data", {}).get("speaker", "")
                     break
-            self._add_chat_history(user_id, message, first_content)
+            await self._add_chat_history(user_id, message, first_content, first_speaker)
 
             # 调用导出函数
             return await self._queued_export_and_send(
                 story_data=story_data,
                 sender_id=user_id,
-                description="瑞希的回复",
+                description=f"{first_speaker}的回复" if first_speaker else "角色回复",
                 event_context=event_context
             )
         except Exception as e:
@@ -2324,7 +2277,7 @@ class MySekaiStorytellerPlugin(Star):
         """剧本模式队列任务：先生成剧本，再导出视频"""
         try:
             # LLM 生成剧本
-            system_prompt, user_prompt = self._build_prompt(scene)
+            system_prompt, user_prompt = await self._build_prompt(scene)
             max_retries = 2
             story_data = None
 
@@ -2350,6 +2303,9 @@ class MySekaiStorytellerPlugin(Star):
                         continue
                     raise e
 
+            if not story_data:
+                raise ValueError("AI 返回的内容无法解析为 JSON")
+
             story_data = await self._ensure_tts_text(story_data)
 
             # 调用导出函数
@@ -2366,7 +2322,7 @@ class MySekaiStorytellerPlugin(Star):
     async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频", event_context: dict = None) -> dict:
         """队列任务调用的视频导出方法"""
         timestamp = int(time.time())
-        story_path = self.story_dir / f"story_{timestamp}.json"
+        story_path = self.story_dir / f"story_{timestamp}_{uuid.uuid4().hex[:8]}.json"
         try:
             with open(str(story_path), "w", encoding="utf-8") as f:
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
@@ -2374,7 +2330,7 @@ class MySekaiStorytellerPlugin(Star):
         except Exception as e:
             logger.warning(f"保存剧本失败: {e}")
 
-        task_key = f"export_{timestamp}_{id(story_data)}"
+        task_key = f"export_{timestamp}_{uuid.uuid4().hex[:8]}"
         self.active_exports.add(task_key)
         start_time = time.time()
 
@@ -2385,7 +2341,7 @@ class MySekaiStorytellerPlugin(Star):
             elapsed = int(time.time() - start_time)
 
             # 记录统计数据
-            self.record_export(result.get("success", False), elapsed)
+            await self.record_export(result.get("success", False), elapsed)
 
             if result.get("success"):
                 local_path = result.get("localPath", "")
@@ -2425,7 +2381,7 @@ class MySekaiStorytellerPlugin(Star):
     async def _export_and_send_video(self, story_data: dict, event, description: str = "视频"):
         """导出视频并发送给用户（聊天模式和剧本模式共用）"""
         timestamp = int(time.time())
-        story_path = self.story_dir / f"story_{timestamp}.json"
+        story_path = self.story_dir / f"story_{timestamp}_{uuid.uuid4().hex[:8]}.json"
         try:
             with open(str(story_path), "w", encoding="utf-8") as f:
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
@@ -2542,11 +2498,13 @@ class MySekaiStorytellerPlugin(Star):
         else:
             yield event.plain_result(f"视频导出失败: {result.get('message', '未知错误')}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command_group("mssadmin")
     def mssadmin(self):
-        """MySekaiStoryteller 管理指令组"""
+        """MySekaiStoryteller 管理指令组（仅管理员）"""
         pass
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("status", alias={'状态', '系统状态', '查看状态'})
     async def status(self, event: AstrMessageEvent):
         """查看插件状态"""
@@ -2562,6 +2520,7 @@ class MySekaiStorytellerPlugin(Star):
         status_text += self.get_stats_report()
         yield event.plain_result(status_text)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("queue", alias={'队列', '排队', '队列状态'})
     async def queue_status_cmd(self, event: AstrMessageEvent):
         """查看队列状态"""
@@ -2576,6 +2535,7 @@ class MySekaiStorytellerPlugin(Star):
         )
         yield event.plain_result(status_text)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("cancel", alias={'取消', '终止', '停止'})
     async def cancel_task_cmd(self, event: AstrMessageEvent, task_id: str):
         """取消指定任务"""
@@ -2585,6 +2545,7 @@ class MySekaiStorytellerPlugin(Star):
         else:
             yield event.plain_result(f"❌ 无法取消任务 {task_id[:8]}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("cleanup", alias={'清理', '清理文件', '删除临时文件'})
     async def cleanup(self, event: AstrMessageEvent):
         """清理文件"""
@@ -2604,6 +2565,7 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"清理文件失败: {e}")
         yield event.plain_result(f"已清理 {cleaned} 个文件")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("resources", alias={'资源列表', '模型列表', '资源'})
     async def resources_cmd(self, event: AstrMessageEvent):
         """查看渲染宿主当前可用的角色/背景/BGM 资源"""
@@ -2625,6 +2587,7 @@ class MySekaiStorytellerPlugin(Star):
         lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记，约 30 秒后自动感知")
         yield event.plain_result("\n".join(lines))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @mssadmin.command("setapi", alias={'设置api', '设置API', '更新api'})
     async def set_api(self, event: AstrMessageEvent, url: str):
         """设置 MSS API 地址"""

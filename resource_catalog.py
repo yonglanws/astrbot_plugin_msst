@@ -4,6 +4,7 @@
 为提示词构建与故事校验提供唯一事实来源。本模块不依赖 astrbot，可独立测试。
 """
 
+import asyncio
 import time
 
 import httpx
@@ -65,6 +66,7 @@ class ResourceCatalog:
         self._data: dict | None = None
         self._fetched_at: float = 0.0
         self._client: httpx.AsyncClient | None = None
+        self._refresh_lock = asyncio.Lock()
 
     async def refresh(self, force: bool = False) -> dict:
         """拉取目录；成功刷新缓存，失败时沿用上一次数据（无数据则用兜底）。"""
@@ -72,22 +74,26 @@ class ResourceCatalog:
         if not force and self._data is not None and now - self._fetched_at < CATALOG_TTL_SECONDS:
             return self._data
 
-        try:
-            if self._client is None:
-                self._client = httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECONDS)
-            resp = await self._client.get(f"{self.base_url}/api/v1/resources")
-            resp.raise_for_status()
-            body = resp.json()
-            if body.get("success") and isinstance(body.get("models"), list):
-                self._data = body
-                self._fetched_at = now
-        except Exception:  # noqa: BLE001 —— 目录拉取失败必须静默降级
-            pass
+        async with self._refresh_lock:
+            now = time.monotonic()
+            if not force and self._data is not None and now - self._fetched_at < CATALOG_TTL_SECONDS:
+                return self._data
+            try:
+                if self._client is None or self._client.is_closed:
+                    self._client = httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECONDS)
+                resp = await self._client.get(f"{self.base_url}/api/v1/resources")
+                resp.raise_for_status()
+                body = resp.json()
+                if body.get("success") and isinstance(body.get("models"), list):
+                    self._data = body
+                    self._fetched_at = now
+            except Exception:  # noqa: BLE001 —— 目录拉取失败必须静默降级
+                pass
 
-        if self._data is None:
-            self._data = FALLBACK_CATALOG
-            self._fetched_at = now
-        return self._data
+            if self._data is None:
+                self._data = FALLBACK_CATALOG
+                self._fetched_at = now
+            return self._data
 
     def view(self) -> "CatalogView":
         """同步快照视图（若无数据先返回兜底；正常流程先 await refresh()）。"""
@@ -194,14 +200,3 @@ class CatalogView:
                 % (m.get("id"), m.get("path"))
             )
         return ",\n    ".join(entries)
-
-    def chat_defaults(self) -> dict:
-        """聊天模式默认角色（目录第一个模型）。"""
-        m = self.default_model()
-        return {
-            "name": m.get("name", "晓山瑞希"),
-            "short_name": self.short_name(m),
-            "model_path": m.get("path", ""),
-            "default_motion": self.default_motion(m.get("id")),
-            "default_facial": self.default_facial(m.get("id")),
-        }

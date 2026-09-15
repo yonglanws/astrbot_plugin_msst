@@ -43,5 +43,29 @@
     "type": "bool",
     "hint": "启用后，「视频对话」和「剧本生成」功能将提示维护中，仅「测试视频对话」和「测试剧本生成」可正常使用。",
     "default": false
+  },
+  "personas": {
+    "description": "角色人格列表",
+    "type": "template_list",
+    "hint": "每条绑定一个 Live2D 角色（与渲染宿主 models.yaml 的 name 或 shortName 一致）。绑定后，聊天和剧本生成都会使用该条目的整段人设提示词；未配置的角色由 AI 依据角色名合理演绎，不注入任何内置人设。TTS 音色仍在渲染宿主 config.yaml 的 tts.characters 中按角色名配置。",
+    "templates": {
+      "persona": {
+        "name": "人格",
+        "items": {
+          "character_name": {
+            "description": "绑定的角色名",
+            "type": "string",
+            "hint": "与渲染宿主 resources/models/models.yaml 中的 name（如 晓山瑞希）或 shortName（如 瑞希）一致",
+            "obvious_hint": true
+          },
+          "prompt": {
+            "description": "整段人设提示词",
+            "type": "text",
+            "hint": "该角色的完整人设：外貌、性格、说话风格、口头禅、禁忌、表情倾向等。将原文注入生成模板的角色段。"
+          }
+        }
+      }
+    },
+    "default": []
   }
 }
