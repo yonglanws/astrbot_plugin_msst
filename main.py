@@ -510,7 +510,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.1", "https://github.com/yonglanws/astrbot_plugin_msst")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.2", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -1683,10 +1683,22 @@ class MySekaiStorytellerPlugin(Star):
                 stderr=asyncio.subprocess.DEVNULL
             )
             try:
-                await asyncio.wait_for(proc.wait(), timeout=120)
+                await asyncio.wait_for(proc.wait(), timeout=60)
             except asyncio.TimeoutError:
                 proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
                 logger.warning("ffmpeg compression timed out, using original file")
+                return input_path
+            except asyncio.CancelledError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                logger.warning("ffmpeg compression cancelled, using original file")
                 return input_path
 
             if proc.returncode == 0 and os.path.exists(output_path):
@@ -2349,11 +2361,18 @@ class MySekaiStorytellerPlugin(Star):
                 file_size = result.get("fileSize", 0)
 
                 if local_path:
-                    local_path = await self._compress_video(local_path)
-                    # 修复双斜杠路径
+                    original_path = local_path
+                    try:
+                        local_path = await self._compress_video(local_path)
+                    except asyncio.CancelledError:
+                        logger.warning("压缩被取消，发送原视频")
+                        local_path = original_path
+                    except Exception as e:
+                        logger.warning(f"压缩失败，发送原视频: {e}")
+                        local_path = original_path
                     if local_path:
                         local_path = self._fix_double_slash_path(local_path)
-                    file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                    file_size = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
 
                 # 构建完整的下载 URL
                 full_download_url = None

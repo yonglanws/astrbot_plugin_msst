@@ -354,6 +354,29 @@ async def run(base_url: str, offline: bool) -> int:
         retry_result = await retry_q.wait_for_task(retry_id, timeout=3)
         check("失败后自动重试并完成", retry_result and retry_result.get("status") == "completed" and attempts["n"] == 2)
         await retry_q.stop()
+
+        grace_q = VideoExportQueue(
+            max_concurrent=1,
+            max_queue_size=2,
+            default_timeout=1,
+            default_max_retries=0,
+            timeout_grace_seconds=2,
+        )
+        await grace_q.start()
+        late_done = {"n": 0}
+
+        async def _late_finish():
+            await asyncio.sleep(1.4)
+            late_done["n"] += 1
+            return {"success": True, "localPath": "late.mp4"}
+
+        late_id = await grace_q.add_task("late-user", _late_finish)
+        late_result = await grace_q.wait_for_task(late_id, timeout=4)
+        check(
+            "超时宽限期内仍交付结果",
+            late_result and late_result.get("status") == "completed" and late_done["n"] == 1,
+        )
+        await grace_q.stop()
     finally:
         await q.stop()
 

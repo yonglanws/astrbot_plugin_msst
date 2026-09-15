@@ -42,7 +42,7 @@ class VideoExportQueue:
 
     def __init__(self, max_concurrent: int = 2, max_queue_size: int = 30,
                  default_timeout: int = 600, default_max_retries: int = 1,
-                 cleanup_interval: int = 180):
+                 cleanup_interval: int = 180, timeout_grace_seconds: int = 180):
         self._queue: list[QueueTask] = []
         self._running_tasks: dict[str, QueueTask] = {}
         self._completed_tasks: dict[str, QueueTask] = {}
@@ -54,6 +54,7 @@ class VideoExportQueue:
         self._default_max_retries = default_max_retries
         self._task_events: dict[str, asyncio.Event] = {}
         self._cleanup_interval = cleanup_interval
+        self._timeout_grace_seconds = timeout_grace_seconds
         self._cleanup_task: Optional[asyncio.Task] = None
         self._processor_task: Optional[asyncio.Task] = None
         self._running = False
@@ -324,10 +325,10 @@ class VideoExportQueue:
     async def _execute_task(self, task: QueueTask):
         """执行单个任务"""
         try:
-            coro = task.coroutine_func(*task.args, **task.kwargs)
-
+            # 不用 wait_for：超时后仍让导出协程收尾，避免视频已下完却被取消。
+            worker = asyncio.create_task(task.coroutine_func(*task.args, **task.kwargs))
             try:
-                result = await asyncio.wait_for(coro, timeout=task.timeout_seconds)
+                result = await asyncio.wait_for(asyncio.shield(worker), timeout=task.timeout_seconds)
                 task.status = TaskStatus.COMPLETED
                 task.result = result
                 task.completed_at = time.time()
@@ -337,13 +338,32 @@ class VideoExportQueue:
                             f"耗时={int(task.completed_at - task.started_at)}秒")
 
             except asyncio.TimeoutError:
-                task.status = TaskStatus.TIMEOUT
-                task.error = f"任务超时（{task.timeout_seconds}秒）"
-                task.completed_at = time.time()
-                self._stats["total_failed"] += 1
-
-                logger.warning(f"任务超时: {task.task_id[:8]}, "
-                               f"用户={task.user_id}")
+                grace_seconds = min(self._timeout_grace_seconds, max(1, task.timeout_seconds // 10 or 1))
+                logger.warning(
+                    f"任务到达时限，等待收尾 {grace_seconds}s: {task.task_id[:8]}, "
+                    f"用户={task.user_id}"
+                )
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(worker), timeout=grace_seconds)
+                    task.status = TaskStatus.COMPLETED
+                    task.result = result
+                    task.completed_at = time.time()
+                    self._stats["total_completed"] += 1
+                    logger.info(
+                        f"任务在宽限期内完成: {task.task_id[:8]}, "
+                        f"耗时={int(task.completed_at - task.started_at)}秒"
+                    )
+                except asyncio.TimeoutError:
+                    worker.cancel()
+                    try:
+                        await worker
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    task.status = TaskStatus.TIMEOUT
+                    task.error = f"任务超时（{task.timeout_seconds}秒）"
+                    task.completed_at = time.time()
+                    self._stats["total_failed"] += 1
+                    logger.warning(f"任务超时: {task.task_id[:8]}, 用户={task.user_id}")
 
             except asyncio.CancelledError:
                 task.status = TaskStatus.CANCELLED
