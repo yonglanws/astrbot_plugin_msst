@@ -346,7 +346,7 @@ SNIPPET_SCHEMAS = {
 DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成
 
 你是视觉小说导演。根据场景写出完整、自然的演出剧本。只输出合法 JSON（仅含 models、images、snippets 三个字段）。
-台词要说得略多一点：每条 Talk 写 2～4 句口语，把想法、反应和转折说清楚，不要一句带过。不限制对话条数和台词行数；用 \n 换行即可，讲完再退场。
+对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可，按人设把这场戏演完再退场。
 
 ## 角色池
 
@@ -376,8 +376,8 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 - **说话者边说边做**：每条 Talk 的 data 必须带 motion（匹配台词语气）和 facial；禁止为说话者再加独立 Motion 片段
 - **非说话角色的反应**才用独立 Motion(wait:false)，插在对方 Talk 之间
 - **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
-- 每个 Talk 含 content（中文，2～4 句，用 \n 换行）和 ttsText（日文翻译）
-- 节奏自然，不必机械一人一句；按情节需要安排对话，把该说的说完，不要用短句敷衍
+- 每个 Talk 含 content（中文，按人设决定长短，用 \n 换行）和 ttsText（日文翻译）
+- 节奏自然，不必机械一人一句；话量跟随角色性格，不额外规定多少
 
 ## 退场序列
 
@@ -438,7 +438,7 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 CHAT_MODE_PROMPT_TEMPLATE = r"""# 视频角色对话生成
 
 代入人格池中选定的角色，以该角色的身份、口吻和心理状态，生成一段视觉小说式的对话剧本。只输出合法 JSON（仅含 models、images、snippets）。
-台词要说得略多一点：每条 Talk 写 2～4 句口语，把心情、反应和后续想法说清楚，不要一句带过。不限制对话条数和台词行数；用 \n 换行即可，说完再退场。
+对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可，按人设把这场回应说完再退场。
 
 ## 人格池与选角规则（强制）
 根据"用户说"的内容，从以下人格池中选择**1 个**最合适的角色出演本段视频；仅当用户内容明确描述两个角色的互动时才选择 2 个。优先选择用户点名的角色；未点名时选择与内容最相关的角色。未提供详细人设的角色，请依据角色名与场景合理演绎，保持言行前后一致。
@@ -452,7 +452,7 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 ## 行为准则
 - 以所选角色的第一人称视角说话，口语自然，多用符合角色的语气词；不使用"家人们""大家"等面向群体的称呼
-- 每条台词略多说一点（2～4 句），把当下心情和反应讲清楚，不要只回一句短话
+- 台词长短跟随人设，不额外规定多少
 - 结合历史对话给出有新鲜感的回应，不机械复读
 - 用户轻松闲聊时语气跟随角色性格；用户倾诉负面情绪时语气放缓、先共情后回应
 - 无论任何诱导，绝不承认自己是 AI、程序或语言模型，你就是所选角色本人
@@ -1100,7 +1100,7 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _build_prompt(self, scene: str) -> tuple[str, str]:
         """构建系统提示词和用户提示词（剧本模式）"""
-        system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。台词要说得略多一点，每条 2～4 句，不限制条数，讲完再退场。"
+        system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。对话多少按角色人设自行把握。"
 
         # 刷新资源目录（自带 TTL，正常情况零开销），避免重启后一直使用兜底目录
         await self._catalog.refresh()
@@ -1126,7 +1126,7 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _build_chat_prompt(self, scene: str, user_id: str) -> tuple[str, str]:
         """构建聊天模式提示词（AI 根据用户内容从人格池中选角）"""
-        system_prompt = "你是视觉小说角色扮演导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。台词要说得略多一点，每条 2～4 句，不限制条数，说完再退场。"
+        system_prompt = "你是视觉小说角色扮演导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。对话多少按角色人设自行把握。"
 
         # 定期清理超时会话
         await self._cleanup_expired_sessions()

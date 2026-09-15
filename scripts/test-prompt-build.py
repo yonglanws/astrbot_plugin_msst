@@ -212,8 +212,8 @@ async def run(base_url: str, offline: bool) -> int:
     check("剧本 prompt 示例退场带动作滑出", '"to":{"side":"Left","offset":-100},"motion"' in story_prompt)
     check("剧本 prompt 要求滑入登场", "必须写 from" in story_prompt)
     check("剧本 prompt 不限制对话条数", "单人7-10条" not in story_prompt and "每角色3-5句" not in story_prompt)
-    check("剧本 prompt 不限制台词行数", "最多3行" not in story_prompt)
-    check("剧本 prompt 鼓励台词略多", "2～4 句" in story_prompt and "不限制对话条数" in story_prompt)
+    check("剧本 prompt 不限制台词行数", "最多3行" not in story_prompt and "2～4 句" not in story_prompt)
+    check("剧本 prompt 按人设把握话量", "按角色人设" in story_prompt)
 
     # 角色池：空配置 → 全部角色通用演绎，且无任何内置人设残留
     check(
@@ -234,8 +234,8 @@ async def run(base_url: str, offline: bool) -> int:
     check("聊天 prompt 含滑入登场", '"from": {"side": "Right", "offset": 100}' in chat_prompt)
     check("聊天 prompt 含退场序列", "HideTalk" in chat_prompt and '"type": "LayoutClear"' in chat_prompt)
     check("聊天 prompt 不限制对话条数", "5-8条对话" not in chat_prompt)
-    check("聊天 prompt 不限制台词行数", "最多 2 个" not in chat_prompt and "最多3行" not in chat_prompt)
-    check("聊天 prompt 鼓励台词略多", "2～4 句" in chat_prompt and "不限制对话条数" in chat_prompt)
+    check("聊天 prompt 不限制台词行数", "最多 2 个" not in chat_prompt and "最多3行" not in chat_prompt and "2～4 句" not in chat_prompt)
+    check("聊天 prompt 按人设把握话量", "按角色人设" in chat_prompt)
     check("聊天 prompt 含首次对话历史", "（首次对话）" in chat_prompt)
     check("聊天 prompt 含场景", "你好呀" in chat_prompt)
     check(
