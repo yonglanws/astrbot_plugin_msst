@@ -611,7 +611,7 @@ class MySekaiStorytellerPlugin(Star):
             cleanup_interval=300
         )
 
-        self._session_timeout_seconds = 1800  # 30分钟超时
+        self._session_timeout_seconds = 3600  # 30分钟超时
 
         self._http_client: Optional[httpx.AsyncClient] = None
         self._http_client_lock = asyncio.Lock()
@@ -816,7 +816,7 @@ class MySekaiStorytellerPlugin(Star):
         return "\n".join(report)
 
     def _cleanup_old_files(self, max_age_hours: int = 2):
-        """清理超过指定时间的视频、剧本和压缩文件"""
+        """清理超过指定时间的视频和剧本文件"""
         now = time.time()
         max_age_seconds = max_age_hours * 3600
         cleaned = 0
@@ -833,14 +833,6 @@ class MySekaiStorytellerPlugin(Star):
                         cleaned += 1
                         freed_bytes += file_size
                         logger.info(f"清理过期文件: {file.name} ({file_size / 1024:.1f} KB)")
-                    elif file.is_file() and file.name.endswith(".compressed.mp4"):
-                        original = file.with_suffix("").with_suffix(".mp4")
-                        if not original.exists():
-                            file_size = file.stat().st_size
-                            file.unlink()
-                            cleaned += 1
-                            freed_bytes += file_size
-                            logger.info(f"清理孤立压缩文件: {file.name} ({file_size / 1024:.1f} KB)")
                 except Exception as e:
                     logger.warning(f"清理文件失败 {file}: {e}")
 
@@ -1638,94 +1630,6 @@ class MySekaiStorytellerPlugin(Star):
                 "message": "视频导出失败，请稍后重试"
             }
 
-    async def _compress_video(self, input_path: str) -> Optional[str]:
-        """压缩视频文件，返回压缩后的路径"""
-        try:
-            input_size = os.path.getsize(input_path)
-            if input_size < 2 * 1024 * 1024:
-                return input_path
-
-            output_path = str(Path(input_path).with_suffix(".compressed.mp4"))
-
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-version",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                await asyncio.wait_for(proc.wait(), timeout=5)
-                if proc.returncode != 0:
-                    logger.warning("ffmpeg not available, skipping compression")
-                    return input_path
-            except (FileNotFoundError, asyncio.TimeoutError):
-                logger.warning("ffmpeg not available, skipping compression")
-                return input_path
-
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-c:v", "libx264",
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-b:v", "1.5M",
-                "-maxrate", "2M",
-                "-bufsize", "4M",
-                "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
-                "-c:a", "aac",
-                "-b:a", "96k",
-                "-movflags", "+faststart",
-                output_path
-            ]
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=60)
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                logger.warning("ffmpeg compression timed out, using original file")
-                return input_path
-            except asyncio.CancelledError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                logger.warning("ffmpeg compression cancelled, using original file")
-                return input_path
-
-            if proc.returncode == 0 and os.path.exists(output_path):
-                output_size = os.path.getsize(output_path)
-                if output_size < input_size:
-                    ratio = (1 - output_size / input_size) * 100
-                    logger.info(f"Video compressed: {input_size / 1024 / 1024:.1f}MB -> {output_size / 1024 / 1024:.1f}MB ({ratio:.0f}% reduction)")
-                    try:
-                        os.unlink(input_path)
-                    except OSError:
-                        pass
-                    return output_path
-                else:
-                    logger.info(f"Compression did not reduce size ({input_size / 1024 / 1024:.1f}MB -> {output_size / 1024 / 1024:.1f}MB), keeping original")
-                    try:
-                        os.unlink(output_path)
-                    except OSError:
-                        pass
-                    return input_path
-            else:
-                logger.warning("ffmpeg compression failed, using original file")
-                return input_path
-
-        except Exception as e:
-            logger.warning(f"Video compression error: {e}, using original file")
-            return input_path
-
     def _calculate_wait_time(self, position: int, task_type: str = "chat") -> tuple[int, int]:
         """
         计算等待时间
@@ -2361,18 +2265,8 @@ class MySekaiStorytellerPlugin(Star):
                 file_size = result.get("fileSize", 0)
 
                 if local_path:
-                    original_path = local_path
-                    try:
-                        local_path = await self._compress_video(local_path)
-                    except asyncio.CancelledError:
-                        logger.warning("压缩被取消，发送原视频")
-                        local_path = original_path
-                    except Exception as e:
-                        logger.warning(f"压缩失败，发送原视频: {e}")
-                        local_path = original_path
-                    if local_path:
-                        local_path = self._fix_double_slash_path(local_path)
-                    file_size = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
+                    local_path = self._fix_double_slash_path(local_path)
+                    file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
 
                 # 构建完整的下载 URL
                 full_download_url = None
@@ -2423,7 +2317,7 @@ class MySekaiStorytellerPlugin(Star):
             file_size = result.get("fileSize", 0)
 
             if local_path:
-                local_path = await self._compress_video(local_path)
+                local_path = self._fix_double_slash_path(local_path)
                 file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
 
             # 优先使用已下载的本地文件发送
