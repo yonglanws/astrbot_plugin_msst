@@ -27,6 +27,13 @@ FALLBACK_CATALOG: dict = {
         }
     ],
     "images": ["bg_e000401.jpg"],
+    "imageDetails": [
+        {
+            "file": "bg_e000401.jpg",
+            "name": "粉色房间·白天",
+            "description": "少女卧室，白天阳光。适合居家闲聊、轻松日常。",
+        }
+    ],
     "voices": [],
     "bgm": [],
 }
@@ -121,7 +128,16 @@ class CatalogView:
     def default_model_path(self) -> str:
         return self.default_model().get("path", FALLBACK_CATALOG["models"][0]["path"])
 
+    def image_details(self) -> list[dict]:
+        details = [d for d in (self.data.get("imageDetails") or []) if d.get("file")]
+        if details:
+            return details
+        return [{"file": name, "name": name, "description": ""} for name in (self.data.get("images") or [])]
+
     def default_image(self) -> str:
+        details = self.image_details()
+        if details:
+            return details[0]["file"]
         images = self.data.get("images") or []
         return images[0] if images else FALLBACK_CATALOG["images"][0]
 
@@ -138,7 +154,9 @@ class CatalogView:
         return {m["path"] for m in self.models}
 
     def valid_images(self) -> set:
-        return set(self.data.get("images") or [])
+        files = set(self.data.get("images") or [])
+        files.update(d["file"] for d in self.image_details() if d.get("file"))
+        return files
 
     def valid_motions(self, model_id) -> set:
         """返回该角色动作集合；空集合表示"目录未提供，不校验"。"""
@@ -181,7 +199,18 @@ class CatalogView:
         return "\n".join(lines)
 
     def image_list(self) -> str:
-        return ", ".join(self.data.get("images") or [])
+        details = self.image_details()
+        if not details:
+            return "（目录暂未提供背景）"
+        lines = []
+        for d in details:
+            name = d.get("name") or d["file"]
+            desc = (d.get("description") or "").strip()
+            if desc:
+                lines.append(f"- {d['file']}（{name}）：{desc}")
+            else:
+                lines.append(f"- {d['file']}（{name}）")
+        return "\n".join(lines)
 
     def model_ref(self, model_id) -> str:
         """角色池档案首行引用：modelId:N, model:路径"""

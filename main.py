@@ -422,8 +422,10 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 ## 可用表情（按角色分组；必须用完整表情名）
 {facial_list}
 
-## 可用背景
+## 可用背景（按场景内容自行选择 file 名写入 images[].image）
 {image_list}
+
+根据场景从上方清单选最贴合的背景；需要换场景时 images 可列多张，snippets 里用对应 imageId。必须使用清单中的 file 名。
 
 ## 输出要求
 1. 只输出合法 JSON，无 markdown、无解释；仅含 models、images、snippets
@@ -432,6 +434,7 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
 5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
 6. delay 用 0、0.05、0.1、0.15、0.2
+7. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
 
 场景：{scene}"""
 
@@ -463,6 +466,11 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 独立 Motion（wait:false）只用于句间附加反应
 - 可用动作：{motion_list}
 - 可用表情：{facial_list}
+
+## 可用背景（按对话氛围自行选择 file 名写入 images[].image）
+{image_list}
+
+根据「用户说」的内容从上方清单选最贴合的一张；必须使用清单中的 file 名。
 
 ## JSON 结构
 每个 Talk 必须包含 content（中文）和 ttsText（日文翻译）。
@@ -498,7 +506,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 2. 开场与退场序列完整；LayoutAppear 必须写 from/to 滑入
 3. speaker 与 modelId 必须来自对照表；每条 Talk 必须带 motion 和 facial
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
-5. images=[{"id":1,"image":"{chat_image}"}]
+5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
 
 历史对话：
@@ -1144,7 +1152,7 @@ class MySekaiStorytellerPlugin(Star):
             "{id_mapping}": view.id_mapping(),
             "{motion_list}": view.motion_list(),
             "{facial_list}": view.facial_list(),
-            "{chat_image}": view.default_image(),
+            "{image_list}": view.image_list(),
             "{chat_history}": chat_history_text,
             "{scene}": scene,
         })
@@ -2492,11 +2500,20 @@ class MySekaiStorytellerPlugin(Star):
             lines.append(
                 f"  {view.short_name(m)}(id={m['id']}) — 动作 {len(m.get('motions') or [])} 个，表情 {len(m.get('facials') or [])} 个"
             )
-        images = data.get("images") or []
+        image_details = data.get("imageDetails") or []
         bgm = data.get("bgm") or []
-        lines.append(f"🖼️ 可用背景（{len(images)}）：{', '.join(images) or '无'}")
+        if image_details:
+            lines.append(f"🖼️ 可用背景（{len(image_details)}，见 resources/images/images.yaml）：")
+            for d in image_details:
+                name = d.get("name") or d.get("file")
+                desc = (d.get("description") or "").strip()
+                suffix = f" — {desc}" if desc else ""
+                lines.append(f"  {d.get('file')}（{name}）{suffix}")
+        else:
+            images = data.get("images") or []
+            lines.append(f"🖼️ 可用背景（{len(images)}）：{', '.join(images) or '无'}")
         lines.append(f"🎵 可用 BGM（{len(bgm)}）：{', '.join(bgm) or '无'}（在宿主 config.yaml 的 bgm 节启用）")
-        lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记，约 30 秒后自动感知")
+        lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记；新增背景：放入 resources/images/ 并在 images.yaml 写描述，约 30 秒后自动感知")
         yield event.plain_result("\n".join(lines))
 
     @mssadmin.command("setapi", alias={'设置api', '设置API', '更新api'})

@@ -15,7 +15,8 @@ Project SEKAI 风格 Live2D 视频渲染框架）的官方配套插件：接收 
   未配置的角色不注入任何内置人设，由 AI 依据角色名合理演绎（详见下文「角色人格配置」）
 - **资源目录动态感知**：从渲染宿主 `GET /api/v1/resources` 拉取角色/动作/表情/背景清单，
   提示词中的角色对照表与校验白名单**自动跟随宿主资源变化**（构建 prompt 前自动刷新，
-  5 分钟 TTL）——新增模型只需在宿主 `resources/models/models.yaml` 登记，无需改插件
+  5 分钟 TTL）——新增模型只需在宿主 `resources/models/models.yaml` 登记；新增背景在
+  `resources/images/images.yaml` 写画面描述，由 AI 按剧情自行选图，无需改插件
 - **结构化输出保障**：优先走 OpenAI 兼容 `json_object` 响应格式；JSON 提取失败或校验失败时，
   把错误信息拼回 prompt 让 AI 自我修正（最多重试 2 次）
 - **资源白名单校验**：LLM 输出的模型路径、动作（motion）、表情（facial）、背景图逐项对照

@@ -135,6 +135,18 @@ OFFLINE_CATALOG = {
         },
     ],
     "images": ["bg_test_01.jpg", "bg_test_02.jpg"],
+    "imageDetails": [
+        {
+            "file": "bg_test_01.jpg",
+            "name": "测试白天房间",
+            "description": "白天阳光的房间，适合轻松日常。",
+        },
+        {
+            "file": "bg_test_02.jpg",
+            "name": "测试夜晚房间",
+            "description": "夜晚台灯的房间，适合深夜倾诉。",
+        },
+    ],
     "voices": [],
     "bgm": [],
 }
@@ -205,6 +217,7 @@ async def run(base_url: str, offline: bool) -> int:
         "可用动作" in story_prompt and f"{view.models[0].get('shortName', '')}(1)" in story_prompt,
     )
     check("剧本 prompt 含背景清单", (view.data.get("images") or [""])[0] in story_prompt)
+    check("剧本 prompt 含背景描述并要求按场景选图", "按场景内容自行选择" in story_prompt)
     check("剧本 prompt 含场景", "深夜的内心独白" in story_prompt)
     check("剧本 prompt 示例 speaker 已泛化", '"speaker":"角色A"' in story_prompt)
     check("剧本 prompt 示例含 Talk 并发动作", '"motion":"w-happy-nod01"' in story_prompt and "说话者边说边做" in story_prompt)
@@ -231,6 +244,7 @@ async def run(base_url: str, offline: bool) -> int:
     check("聊天 prompt 含选角规则", "选择**1 个**" in chat_prompt)
     check("聊天 prompt 含对照表", "modelId=1" in chat_prompt)
     check("聊天 prompt 含动作清单", "可用动作" in chat_prompt)
+    check("聊天 prompt 含背景清单并要求按氛围选图", "按对话氛围自行选择" in chat_prompt and (view.data.get("images") or [""])[0] in chat_prompt)
     check("聊天 prompt 含滑入登场", '"from": {"side": "Right", "offset": 100}' in chat_prompt)
     check("聊天 prompt 含退场序列", "HideTalk" in chat_prompt and '"type": "LayoutClear"' in chat_prompt)
     check("聊天 prompt 不限制对话条数", "5-8条对话" not in chat_prompt)
