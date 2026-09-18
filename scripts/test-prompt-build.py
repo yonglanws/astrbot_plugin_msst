@@ -227,7 +227,8 @@ async def run(base_url: str, offline: bool) -> int:
     check("剧本 prompt 不限制对话条数", "单人7-10条" not in story_prompt and "每角色3-5句" not in story_prompt)
     check("剧本 prompt 不限制台词行数", "最多3行" not in story_prompt and "2～4 句" not in story_prompt)
     check("剧本 prompt 按人设把握话量", "按角色人设" in story_prompt)
-    check("剧本 prompt 建议约三分钟并限制五分钟", "约 3 分钟" in story_prompt and "5 分钟" in story_prompt)
+    check("剧本 prompt 要求约三分钟短戏并禁止超长", "约 3 分钟" in story_prompt and "短戏" in story_prompt and "禁止超长" in story_prompt)
+    check("剧本 prompt 不以五分钟为上限去写长", "5 分钟" not in story_prompt and "最高不超过" not in story_prompt)
     check("剧本 prompt 限制真冬过于开心的表情", "朝比奈真冬" in story_prompt and "过于开心" in story_prompt)
 
     # 角色池：空配置 → 全部角色通用演绎，且无任何内置人设残留

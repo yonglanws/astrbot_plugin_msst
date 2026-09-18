@@ -345,8 +345,8 @@ SNIPPET_SCHEMAS = {
 
 DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成
 
-你是视觉小说导演。根据场景写出完整、自然的演出剧本。只输出合法 JSON（仅含 models、images、snippets 三个字段）。
-对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可，按人设把这场戏演完再退场。
+你是视觉小说导演。根据场景写出一场约 3 分钟的短戏，完整、自然，但不要写成超长剧情。只输出合法 JSON（仅含 models、images、snippets 三个字段）。
+对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可。一场只演完一件事或一个情绪转折就退场，禁止把整段人生、多条支线或连续多场戏塞进这一次。
 
 ## 角色池
 
@@ -382,7 +382,7 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 
 ## 成片时长
 
-目标约 3 分钟；宁可收束也不要拖到 5 分钟以上。按人设说话，但整场戏（含开场滑入、对话、退场）必须能在 5 分钟内演完。
+这是一场约 3 分钟的短戏（含开场滑入、对话、退场），不是长篇。口语节奏下整场大约三分钟说完就收：尽快入戏，说完一个完整小事件或一个情绪转折立刻退场。宁可略短，也不要写成能演很久的连续剧。禁止大段铺垫、多场景跳转、多人轮番独白、重复确认同一句意思。话量仍跟人设走，但整场体量必须按三分钟短戏来写。
 
 ## 退场序列
 
@@ -440,7 +440,7 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
 6. delay 用 0、0.05、0.1、0.15、0.2
 7. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
-8. 成片目标约 3 分钟，最高不超过 5 分钟
+8. 成片约 3 分钟的短戏：只演一件事就收，禁止超长剧情
 9. 真冬禁止过于开心的表情与欢快动作
 
 场景：{scene}"""
@@ -549,7 +549,7 @@ class MySekaiStorytellerPlugin(Star):
         # 插件配置
         self.mss_api_url = config.get("mss_api_url", "http://127.0.0.1:9881")
         self.export_timeout = config.get("export_timeout", 600)
-        self.max_concurrent_exports = config.get("max_concurrent_exports", 1)
+        self.max_concurrent_exports = config.get("max_concurrent_exports", 2)
         self.temp_dir = config.get("temp_dir", "")
         self.callback_api_base = config.get("callback_api_base", "").rstrip("/")
 
@@ -1107,7 +1107,7 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _build_prompt(self, scene: str) -> tuple[str, str]:
         """构建系统提示词和用户提示词（剧本模式）"""
-        system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。对话多少按角色人设自行把握。"
+        system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。写成约 3 分钟的短戏，禁止超长剧情；对话多少按角色人设自行把握。"
 
         # 刷新资源目录（自带 TTL，正常情况零开销），避免重启后一直使用兜底目录
         await self._catalog.refresh()

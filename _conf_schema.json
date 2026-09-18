@@ -23,8 +23,8 @@
   "max_concurrent_exports": {
     "description": "最大并发导出数",
     "type": "int",
-    "hint": "同时进行的视频导出任务数上限。增大此值会提高并发能力但可能增加服务器负载。",
-    "default": 1
+    "hint": "同时进行的视频导出任务数上限。需与渲染宿主 render.workers 对齐，默认 2。",
+    "default": 2
   },
   "temp_dir": {
     "description": "临时文件存储目录",
