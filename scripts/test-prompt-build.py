@@ -234,6 +234,7 @@ async def run(base_url: str, offline: bool) -> int:
         "剧本 prompt 含台词排版硬规则",
         "台词排版硬规则" in story_prompt and "连续两个及以上" in story_prompt and "最多 3 行" in story_prompt,
     )
+    check("剧本 prompt 明确拆条不减话量", "不是话量限制" in story_prompt and "连续多条 Talk" in story_prompt)
 
     # 角色池：空配置 → 全部角色通用演绎，且无任何内置人设残留
     check(
@@ -261,6 +262,7 @@ async def run(base_url: str, offline: bool) -> int:
         "聊天 prompt 含台词排版硬规则",
         "台词排版硬规则" in chat_prompt and "连续两个及以上" in chat_prompt and "最多 3 行" in chat_prompt,
     )
+    check("聊天 prompt 明确拆条不减话量", "不是话量限制" in chat_prompt and "连续多条 Talk" in chat_prompt)
     check("聊天 prompt 含首次对话历史", "（首次对话）" in chat_prompt)
     check("聊天 prompt 含场景", "你好呀" in chat_prompt)
     check(
@@ -417,14 +419,42 @@ async def run(base_url: str, offline: bool) -> int:
     check("连续换行折叠为单个", san("你好\n\n\n世界") == "你好\n世界")
     check("首尾空白与空行去除", san("\n\n 你好呀 \n") == "你好呀")
     long_line = san("一" * 30)
-    check("超宽长行硬折行", long_line == "一" * 24 + "\n" + "一" * 6)
+    check("超宽长行硬折行", long_line == "一" * 26 + "\n" + "一" * 4)
     half_width = san("a" * 60)
-    check("半角按半宽折行", half_width.split("\n")[0] == "a" * 48 and len(half_width.split("\n")) == 2)
-    overflow = san("一" * 24 + "\n" + "一" * 24 + "\n" + "一" * 24 + "\n" + "一" * 5)
-    overflow_lines = overflow.split("\n")
-    check("超过 3 行截断加省略号", len(overflow_lines) == 3 and overflow_lines[-1].endswith("…"))
+    check("半角按半宽折行", half_width.split("\n")[0] == "a" * 52 and len(half_width.split("\n")) == 2)
+    overflow = san("一" * 26 + "\n" + "一" * 26 + "\n" + "一" * 26 + "\n" + "一" * 5)
+    check("超行不截断（交给拆条处理）", len(overflow.split("\n")) == 4 and "…" not in overflow)
     check("Telop 模式只折叠不折行", san("一" * 30 + "\n\nb", wrap=False) == "一" * 30 + "\nb")
     check("正常台词原样保留", san("今天天气真好呢～\n要不要出去走走？") == "今天天气真好呢～\n要不要出去走走？")
+
+    split_story = {
+        "snippets": [
+            {
+                "type": "Talk",
+                "wait": False,
+                "delay": 0,
+                "data": {
+                    "speaker": "瑞希",
+                    "content": "第一行内容\n第二行内容\n第三行内容\n第四行内容\n第五行内容",
+                    "ttsText": "一行目。\n二行目。",
+                    "modelId": 1,
+                    "voice": "1",
+                    "motion": "m1",
+                    "facial": "f1",
+                },
+            },
+            {"type": "HideTalk", "wait": True, "delay": 0.2, "data": {}},
+        ]
+    }
+    split_result = main.MySekaiStorytellerPlugin._split_overflow_talks(split_story)
+    talks = [s for s in split_result["snippets"] if s.get("type") == "Talk"]
+    check("超行 Talk 拆分为多条", len(talks) == 2)
+    check("拆分保留全部台词行", "\n".join(t["data"]["content"] for t in talks).replace("\n", "") == "第一行内容第二行内容第三行内容第四行内容第五行内容")
+    check("拆分续条 delay 为 0.15", talks[1]["delay"] == 0.15)
+    check("拆分保留说话人与动作", all(t["data"]["speaker"] == "瑞希" and t["data"]["motion"] == "m1" for t in talks))
+    check("拆分均分 ttsText", all(str(t["data"]["ttsText"]).strip() for t in talks) and sum(len(t["data"]["ttsText"]) for t in talks) >= 6)
+    non_talk = [s for s in split_result["snippets"] if s.get("type") != "Talk"]
+    check("非 Talk 片段不受拆分影响", len(non_talk) == 1)
 
     print("\n" + ("ALL PROMPT BUILD TESTS PASSED" if not fails else f"{len(fails)} FAILED"))
     return 1 if fails else 0

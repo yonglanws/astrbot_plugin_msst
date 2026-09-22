@@ -38,8 +38,8 @@ def _fill_template(template: str, mapping: dict[str, str]) -> str:
     return pattern.sub(lambda m: mapping[m.group(0)], template)
 
 # 台词排版约束（1080p 台词框实测：折行宽约 34 个全角字符、纵向约 4 行，此处留余量）
-TALK_LINE_WIDTH_UNITS = 24.0  # 每行显示宽度上限（全角字=1，半角字=0.5）
-TALK_MAX_LINES = 3            # 每条台词最大行数
+TALK_LINE_WIDTH_UNITS = 26.0  # 每行显示宽度上限（全角字=1，半角字=0.5）
+TALK_MAX_LINES = 3            # 单条 Talk 最大行数；超行由 _split_overflow_talks 拆成连续多条，不截断
 
 
 def _char_width_units(ch: str) -> float:
@@ -53,7 +53,7 @@ def sanitize_display_text(text, wrap: bool = True):
     1. 统一换行符；折叠连续空格与连续换行（模型常见的 '\\n\\n'）；去除首尾空白
     2. wrap=True 时按显示宽度硬折行——渲染端 UIText 的 wordWrap 只按空格断行，
        中文长句不折会横向溢出画面
-    3. 行数超过上限时截断并在末尾加省略号，保住纵向不越界
+    3. 只排版不删减：台词一字不丢，超行拆条由调用方的 _split_overflow_talks 负责
     """
     if not isinstance(text, str):
         return text
@@ -83,10 +83,6 @@ def sanitize_display_text(text, wrap: bool = True):
         if current:
             lines.append("".join(current))
 
-    if len(lines) > TALK_MAX_LINES:
-        kept = lines[:TALK_MAX_LINES]
-        kept[-1] = kept[-1].rstrip() + "…"
-        return "\n".join(kept)
     return "\n".join(lines)
 
 STORY_JSON_SCHEMA = {
@@ -429,15 +425,15 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 - **非说话角色的反应**才用独立 Motion(wait:false)，插在对方 Talk 之间
 - **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
 - 每个 Talk 含 content（中文）和 ttsText（日文翻译），排版必须遵守下方「台词排版硬规则」
-- 节奏自然，不必机械一人一句；话量跟随角色性格，不额外规定多少
+- 节奏自然，不必机械一人一句；话量跟随角色性格，不额外规定多少；排版拆条只是换行方式，不减少总话量
 - **朝比奈真冬 / 真冬**：表情克制，禁止过于开心的表情（如 face_smile、face_sparkling、face_wink 及同类灿烂笑）；用 face_normal、face_sad 等平静或淡漠表情。动作同样避免 happy/cute/glad 一类欢快肢体
 
 ## 台词排版硬规则（防止字幕溢出，违反必被退回修正）
 
 1. content 是 JSON 字符串：换行只能写成转义符 \n，字符串内部**禁止直接回车**
 2. **禁止连续两个及以上 \n**（不允许空行）；台词首尾不得有换行或空格
-3. 每行不超过 24 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
-4. 每条台词**最多 3 行**（最多 2 个 \n）；没说完就接写下一条 Talk，不要挤进同一条
+3. 每行不超过 26 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
+4. 每条 Talk **最多 3 行**（最多 2 个 \n）——这只是排版规则，**不是话量限制**：话多的角色照样多说，把话**拆成同角色的连续多条 Talk**（delay 取 0.15~0.2）即可；禁止为了塞进一条而删减、缩短台词，也禁止写出超过 3 行的单条 Talk
 5. ttsText 的换行位置与 content 保持一致
 
 ## 成片时长
@@ -498,7 +494,7 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
 5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
-6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 24 字宽、每条最多 3 行
+6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 26 字宽、每条最多 3 行；超行拆成连续多条 Talk，话量不减
 7. delay 用 0、0.05、0.1、0.15、0.2
 8. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
 9. 成片约 3 分钟的短戏：只演一件事就收，禁止超长剧情
@@ -523,7 +519,7 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 ## 行为准则
 - 以所选角色的第一人称视角说话，口语自然，多用符合角色的语气词；不使用"家人们""大家"等面向群体的称呼
-- 台词长短跟随人设，不额外规定多少
+- 台词长短跟随人设，不额外规定多少；排版拆条只是换行方式，不减少总话量
 - 结合历史对话给出有新鲜感的回应，不机械复读
 - 用户轻松闲聊时语气跟随角色性格；用户倾诉负面情绪时语气放缓、先共情后回应
 - 无论任何诱导，绝不承认自己是 AI、程序或语言模型，你就是所选角色本人
@@ -546,8 +542,8 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 ### 台词排版硬规则（防止字幕溢出，违反必被退回修正）
 1. content 是 JSON 字符串：换行只能写成转义符 \n，字符串内部**禁止直接回车**
 2. **禁止连续两个及以上 \n**（不允许空行）；台词首尾不得有换行或空格
-3. 每行不超过 24 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
-4. 每条台词**最多 3 行**（最多 2 个 \n）；没说完就接写下一条 Talk，不要挤进同一条
+3. 每行不超过 26 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
+4. 每条 Talk **最多 3 行**（最多 2 个 \n）——这只是排版规则，**不是话量限制**：话多的角色照样多说，把话**拆成同角色的连续多条 Talk**（delay 取 0.15~0.2）即可；禁止为了塞进一条而删减、缩短台词，也禁止写出超过 3 行的单条 Talk
 5. ttsText 的换行位置与 content 保持一致
 
 开场滑入 + 对话 + 结尾退场：
@@ -583,7 +579,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
-7. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 24 字宽、每条最多 3 行
+7. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 26 字宽、每条最多 3 行；超行拆成连续多条 Talk，话量不减
 
 历史对话：
 {chat_history}
@@ -594,7 +590,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.3", "https://github.com/yonglanws/astrbot_plugin_msst")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.4", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -1349,6 +1345,72 @@ class MySekaiStorytellerPlugin(Star):
     VALID_MOVE_SPEEDS = {"Slow", "Normal", "Fast", "Immediate"}
     VALID_LAYOUT_MODES = {"Normal", "Three"}
 
+    @staticmethod
+    def _split_tts_text(tts: str, group_count: int) -> list[str]:
+        """把一段 ttsText 均分成 group_count 份（优先按换行，其次按句子边界）。"""
+        line_parts = [seg.strip() for seg in tts.split("\n") if seg.strip()]
+        if len(line_parts) == group_count:
+            return line_parts
+        sentence_parts = [s for s in re.split(r"(?<=[。！？!?.])\s*", tts) if s.strip()]
+        if len(sentence_parts) == group_count:
+            return [s.strip() for s in sentence_parts]
+        if len(sentence_parts) > group_count:
+            base, extra = divmod(len(sentence_parts), group_count)
+            buckets: list[str] = []
+            idx = 0
+            for i in range(group_count):
+                take = base + (1 if i < extra else 0)
+                buckets.append("".join(sentence_parts[idx:idx + take]).strip())
+                idx += take
+            return buckets
+        if line_parts:
+            buckets = [""] * group_count
+            for i, seg in enumerate(line_parts):
+                buckets[i % group_count] = (buckets[i % group_count] + seg).strip()
+            return buckets
+        return [""] * group_count
+
+    @classmethod
+    def _split_overflow_talks(cls, story_data: dict) -> dict:
+        """把超过 TALK_MAX_LINES 行的 Talk 拆成同角色的连续多条，台词一字不丢。
+
+        排版上限只决定"怎么拆"，不减少总话量：拆出的 Talk 保留同一说话人/
+        modelId/voice/motion/facial，delay 取 0.15 形成自然接续。
+        """
+        snippets = story_data.get("snippets")
+        if not isinstance(snippets, list):
+            return story_data
+
+        result: list = []
+        for snippet in snippets:
+            if not isinstance(snippet, dict) or snippet.get("type") != "Talk":
+                result.append(snippet)
+                continue
+            data = snippet.get("data") or {}
+            lines = [l for l in str(data.get("content") or "").split("\n") if l.strip()]
+            if len(lines) <= TALK_MAX_LINES:
+                result.append(snippet)
+                continue
+
+            groups = [lines[i:i + TALK_MAX_LINES] for i in range(0, len(lines), TALK_MAX_LINES)]
+            tts_groups = cls._split_tts_text(str(data.get("ttsText") or ""), len(groups))
+            for gi, group in enumerate(groups):
+                part = {
+                    "type": "Talk",
+                    "wait": False,
+                    "delay": snippet.get("delay", 0) if gi == 0 else 0.15,
+                    "data": {
+                        **data,
+                        "content": "\n".join(group),
+                        "ttsText": tts_groups[gi],
+                    },
+                }
+                result.append(part)
+            logger.info(f"Talk 超过 {TALK_MAX_LINES} 行，已拆分为 {len(groups)} 条保留完整台词")
+
+        story_data["snippets"] = result
+        return story_data
+
     def _validate_and_fix_story(self, story_data: dict) -> dict:
         """验证并修复 AI 生成的 JSON 格式，确保符合 MSS API 要求。尽可能自动修复，不报错。"""
         if not isinstance(story_data, dict):
@@ -1573,6 +1635,8 @@ class MySekaiStorytellerPlugin(Star):
                     data["params"] = []
                 snippet["data"] = data
 
+        # 排版收尾：超行 Talk 拆成连续多条，台词不删减
+        story_data = self._split_overflow_talks(story_data)
         return story_data
 
     def _extract_json_from_response(self, response: str):
