@@ -230,6 +230,10 @@ async def run(base_url: str, offline: bool) -> int:
     check("剧本 prompt 要求约三分钟短戏并禁止超长", "约 3 分钟" in story_prompt and "短戏" in story_prompt and "禁止超长" in story_prompt)
     check("剧本 prompt 不以五分钟为上限去写长", "5 分钟" not in story_prompt and "最高不超过" not in story_prompt)
     check("剧本 prompt 限制真冬过于开心的表情", "朝比奈真冬" in story_prompt and "过于开心" in story_prompt)
+    check(
+        "剧本 prompt 含台词排版硬规则",
+        "台词排版硬规则" in story_prompt and "连续两个及以上" in story_prompt and "最多 3 行" in story_prompt,
+    )
 
     # 角色池：空配置 → 全部角色通用演绎，且无任何内置人设残留
     check(
@@ -251,8 +255,12 @@ async def run(base_url: str, offline: bool) -> int:
     check("聊天 prompt 含滑入登场", '"from": {"side": "Right", "offset": 100}' in chat_prompt)
     check("聊天 prompt 含退场序列", "HideTalk" in chat_prompt and '"type": "LayoutClear"' in chat_prompt)
     check("聊天 prompt 不限制对话条数", "5-8条对话" not in chat_prompt)
-    check("聊天 prompt 不限制台词行数", "最多 2 个" not in chat_prompt and "最多3行" not in chat_prompt and "2～4 句" not in chat_prompt)
+    check("聊天 prompt 无旧版台词长度限制", "最多3行" not in chat_prompt and "2～4 句" not in chat_prompt)
     check("聊天 prompt 按人设把握话量", "按角色人设" in chat_prompt)
+    check(
+        "聊天 prompt 含台词排版硬规则",
+        "台词排版硬规则" in chat_prompt and "连续两个及以上" in chat_prompt and "最多 3 行" in chat_prompt,
+    )
     check("聊天 prompt 含首次对话历史", "（首次对话）" in chat_prompt)
     check("聊天 prompt 含场景", "你好呀" in chat_prompt)
     check(
@@ -400,6 +408,23 @@ async def run(base_url: str, offline: bool) -> int:
     check("用户错误反馈隐藏堆栈", "Traceback" not in main.MySekaiStorytellerPlugin._user_error("Traceback (most recent call last):\n  File"))
     check("用户错误反馈隐藏路径", "D:\\tmp\\x.py" not in main.MySekaiStorytellerPlugin._user_error("failed at D:\\tmp\\x.py"))
     check("JSON 失败转成可读提示", "换个说法" in main.MySekaiStorytellerPlugin._user_error("AI 返回的内容无法解析为 JSON"))
+
+    # =========================================================================
+    # 场景五：台词排版清洗（防溢出兜底）
+    # =========================================================================
+    san = main.sanitize_display_text
+
+    check("连续换行折叠为单个", san("你好\n\n\n世界") == "你好\n世界")
+    check("首尾空白与空行去除", san("\n\n 你好呀 \n") == "你好呀")
+    long_line = san("一" * 30)
+    check("超宽长行硬折行", long_line == "一" * 24 + "\n" + "一" * 6)
+    half_width = san("a" * 60)
+    check("半角按半宽折行", half_width.split("\n")[0] == "a" * 48 and len(half_width.split("\n")) == 2)
+    overflow = san("一" * 24 + "\n" + "一" * 24 + "\n" + "一" * 24 + "\n" + "一" * 5)
+    overflow_lines = overflow.split("\n")
+    check("超过 3 行截断加省略号", len(overflow_lines) == 3 and overflow_lines[-1].endswith("…"))
+    check("Telop 模式只折叠不折行", san("一" * 30 + "\n\nb", wrap=False) == "一" * 30 + "\nb")
+    check("正常台词原样保留", san("今天天气真好呢～\n要不要出去走走？") == "今天天气真好呢～\n要不要出去走走？")
 
     print("\n" + ("ALL PROMPT BUILD TESTS PASSED" if not fails else f"{len(fails)} FAILED"))
     return 1 if fails else 0

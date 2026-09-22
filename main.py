@@ -37,6 +37,58 @@ def _fill_template(template: str, mapping: dict[str, str]) -> str:
     pattern = re.compile("|".join(re.escape(token) for token in mapping))
     return pattern.sub(lambda m: mapping[m.group(0)], template)
 
+# 台词排版约束（1080p 台词框实测：折行宽约 34 个全角字符、纵向约 4 行，此处留余量）
+TALK_LINE_WIDTH_UNITS = 24.0  # 每行显示宽度上限（全角字=1，半角字=0.5）
+TALK_MAX_LINES = 3            # 每条台词最大行数
+
+
+def _char_width_units(ch: str) -> float:
+    """字符显示宽度：CJK/全角记 1，其余（ASCII 等）记 0.5。"""
+    return 1.0 if ord(ch) >= 0x2E80 else 0.5
+
+
+def sanitize_display_text(text, wrap: bool = True):
+    """清洗台词/字幕文本，保证渲染不溢出、不出现连续空行。
+
+    1. 统一换行符；折叠连续空格与连续换行（模型常见的 '\\n\\n'）；去除首尾空白
+    2. wrap=True 时按显示宽度硬折行——渲染端 UIText 的 wordWrap 只按空格断行，
+       中文长句不折会横向溢出画面
+    3. 行数超过上限时截断并在末尾加省略号，保住纵向不越界
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"[ \t\u3000]+", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return cleaned
+
+    if not wrap:
+        return "\n".join(seg for seg in (s.strip() for s in cleaned.split("\n")) if seg)
+
+    lines: list[str] = []
+    for segment in cleaned.split("\n"):
+        width = 0.0
+        current: list[str] = []
+        for ch in segment:
+            w = _char_width_units(ch)
+            if current and width + w > TALK_LINE_WIDTH_UNITS:
+                lines.append("".join(current))
+                current = [ch]
+                width = w
+            else:
+                current.append(ch)
+                width += w
+        if current:
+            lines.append("".join(current))
+
+    if len(lines) > TALK_MAX_LINES:
+        kept = lines[:TALK_MAX_LINES]
+        kept[-1] = kept[-1].rstrip() + "…"
+        return "\n".join(kept)
+    return "\n".join(lines)
+
 STORY_JSON_SCHEMA = {
     "type": "object",
     "required": ["models", "images", "snippets"],
@@ -346,7 +398,7 @@ SNIPPET_SCHEMAS = {
 DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成
 
 你是视觉小说导演。根据场景写出一场约 3 分钟的短戏，完整、自然，但不要写成超长剧情。只输出合法 JSON（仅含 models、images、snippets 三个字段）。
-对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可。一场只演完一件事或一个情绪转折就退场，禁止把整段人生、多条支线或连续多场戏塞进这一次。
+对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数。一场只演完一件事或一个情绪转折就退场，禁止把整段人生、多条支线或连续多场戏塞进这一次。
 
 ## 角色池
 
@@ -376,9 +428,17 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 - **说话者边说边做**：每条 Talk 的 data 必须带 motion（匹配台词语气）和 facial；禁止为说话者再加独立 Motion 片段
 - **非说话角色的反应**才用独立 Motion(wait:false)，插在对方 Talk 之间
 - **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
-- 每个 Talk 含 content（中文，按人设决定长短，用 \n 换行）和 ttsText（日文翻译）
+- 每个 Talk 含 content（中文）和 ttsText（日文翻译），排版必须遵守下方「台词排版硬规则」
 - 节奏自然，不必机械一人一句；话量跟随角色性格，不额外规定多少
 - **朝比奈真冬 / 真冬**：表情克制，禁止过于开心的表情（如 face_smile、face_sparkling、face_wink 及同类灿烂笑）；用 face_normal、face_sad 等平静或淡漠表情。动作同样避免 happy/cute/glad 一类欢快肢体
+
+## 台词排版硬规则（防止字幕溢出，违反必被退回修正）
+
+1. content 是 JSON 字符串：换行只能写成转义符 \n，字符串内部**禁止直接回车**
+2. **禁止连续两个及以上 \n**（不允许空行）；台词首尾不得有换行或空格
+3. 每行不超过 24 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
+4. 每条台词**最多 3 行**（最多 2 个 \n）；没说完就接写下一条 Talk，不要挤进同一条
+5. ttsText 的换行位置与 content 保持一致
 
 ## 成片时长
 
@@ -438,17 +498,18 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
 5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
-6. delay 用 0、0.05、0.1、0.15、0.2
-7. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
-8. 成片约 3 分钟的短戏：只演一件事就收，禁止超长剧情
-9. 真冬禁止过于开心的表情与欢快动作
+6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 24 字宽、每条最多 3 行
+7. delay 用 0、0.05、0.1、0.15、0.2
+8. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
+9. 成片约 3 分钟的短戏：只演一件事就收，禁止超长剧情
+10. 真冬禁止过于开心的表情与欢快动作
 
 场景：{scene}"""
 
 CHAT_MODE_PROMPT_TEMPLATE = r"""# 视频角色对话生成
 
 代入人格池中选定的角色，以该角色的身份、口吻和心理状态，生成一段视觉小说式的对话剧本。只输出合法 JSON（仅含 models、images、snippets）。
-对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数；台词用 \n 换行即可，按人设把这场回应说完再退场。
+对话多少、每句长短都按角色人设来：话多的角色就多说，话少的角色就少说。不规定条数和字数，按人设把这场回应说完再退场。
 
 ## 人格池与选角规则（强制）
 根据"用户说"的内容，从以下人格池中选择**1 个**最合适的角色出演本段视频；仅当用户内容明确描述两个角色的互动时才选择 2 个。优先选择用户点名的角色；未点名时选择与内容最相关的角色。未提供详细人设的角色，请依据角色名与场景合理演绎，保持言行前后一致。
@@ -481,6 +542,13 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 ## JSON 结构
 每个 Talk 必须包含 content（中文）和 ttsText（日文翻译）。
+
+### 台词排版硬规则（防止字幕溢出，违反必被退回修正）
+1. content 是 JSON 字符串：换行只能写成转义符 \n，字符串内部**禁止直接回车**
+2. **禁止连续两个及以上 \n**（不允许空行）；台词首尾不得有换行或空格
+3. 每行不超过 24 个字宽（全角字=1，半角字=0.5）；一行写不下，就在最近的标点或词组后换 \n
+4. 每条台词**最多 3 行**（最多 2 个 \n）；没说完就接写下一条 Talk，不要挤进同一条
+5. ttsText 的换行位置与 content 保持一致
 
 开场滑入 + 对话 + 结尾退场：
 ```
@@ -515,6 +583,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
+7. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 24 字宽、每条最多 3 行
 
 历史对话：
 {chat_history}
@@ -525,7 +594,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.2", "https://github.com/yonglanws/astrbot_plugin_msst")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.3", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -1346,7 +1415,7 @@ class MySekaiStorytellerPlugin(Star):
                 data["speaker"] = self._to_str(data.get("speaker"), view.name_by_id(default_model.get("id")))
                 content = self._to_str(data.get("content"), "...")
                 content = content.replace("\\n", "\n")
-                data["content"] = content
+                data["content"] = sanitize_display_text(content)
                 data["modelId"] = self._to_number(data.get("modelId"), default_model.get("id", 1))
                 data["voice"] = self._to_str(data.get("voice"), "")
                 # 说话并发动作/表情：非法值回退该角色默认；空串 = 保持当前姿态不播
@@ -1487,7 +1556,7 @@ class MySekaiStorytellerPlugin(Star):
 
             elif snippet_type == "Telop":
                 data = snippet.get("data", {})
-                data["content"] = self._to_str(data.get("content"), "")
+                data["content"] = sanitize_display_text(self._to_str(data.get("content"), ""), wrap=False)
                 snippet["data"] = data
 
             elif snippet_type == "ChangeLayoutMode":
