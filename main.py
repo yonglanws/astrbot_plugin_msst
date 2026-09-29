@@ -1,5 +1,7 @@
 import asyncio
+import copy
 import json
+import math
 import os
 import re
 import time
@@ -136,6 +138,24 @@ STORY_JSON_SCHEMA = {
     }
 }
 
+ACTION_LIST_SCHEMA = {
+    "type": "array",
+    "maxItems": 24,
+    "items": {
+        "type": "object",
+        "required": ["at", "modelId"],
+        "additionalProperties": False,
+        "properties": {
+            "at": {"type": "number", "minimum": 0, "maximum": 1,
+                   "description": "相对片段实际时长的比例，不是秒"},
+            "modelId": {"type": "integer"},
+            "motion": {"type": "string", "minLength": 1},
+            "facial": {"type": "string", "minLength": 1},
+        },
+        "anyOf": [{"required": ["motion"]}, {"required": ["facial"]}],
+    },
+}
+
 SNIPPET_SCHEMAS = {
     "ChangeLayoutMode": {
         "required": ["type", "wait", "delay", "data"],
@@ -147,7 +167,7 @@ SNIPPET_SCHEMAS = {
                 "type": "object",
                 "required": ["mode"],
                 "properties": {
-                    "mode": {"type": "string", "enum": ["Normal", "Three"]}
+                    "mode": {"type": "string", "enum": ["Normal"]}
                 }
             }
         }
@@ -252,7 +272,8 @@ SNIPPET_SCHEMAS = {
                     "modelId": {"type": "number", "default": -1},
                     "voice": {"type": "string", "default": ""},
                     "motion": {"type": "string", "default": "", "description": "说话时的并发身体动作（边说边做），必须用该角色可用动作清单里的名字"},
-                    "facial": {"type": "string", "default": "", "description": "说话时的并发表情，可选"}
+                    "facial": {"type": "string", "default": "", "description": "说话时的并发表情，可选"},
+                    "actions": ACTION_LIST_SCHEMA,
                 }
             }
         }
@@ -310,7 +331,10 @@ SNIPPET_SCHEMAS = {
                     "modelId": {"type": "number"},
                     "motion": {"type": "string", "description": "动作名称"},
                     "facial": {"type": "string", "description": "表情名称"},
-                    "facialFirst": {"type": "boolean", "default": True}
+                    "facialFirst": {"type": "boolean", "default": True},
+                    "duration": {"type": "number", "exclusiveMinimum": 0, "maximum": 120,
+                                 "description": "actions 序列时长（秒），默认 2"},
+                    "actions": ACTION_LIST_SCHEMA,
                 }
             }
         }
@@ -400,7 +424,7 @@ DEFAULT_PROMPT_TEMPLATE = r"""# 视觉小说剧本生成
 
 {character_pool}
 
-> 根据场景从角色池选角：独白/个人感想用 1 人；对话、互动用 2 人（必要时 3 人用 Three 布局）。优先选场景点名的角色。
+> 根据场景从角色池选角：独白/个人感想用 1 人，对话/互动用两人。优先选场景点名的角色；整场可有更多角色轮换，但任意时刻最多两人在场。
 
 ## modelId 对照表（不可混淆）
 {model_table}
@@ -409,20 +433,25 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 ## 布局
 
-- **Normal 双人**：先登场 to.side="Left"，后登场 to.side="Right"；禁止两人同侧或同为 Center
-- **Three**：三人分别 Left / Center / Right
-- **单人**：to.side="Center"
+- ChangeLayoutMode.data.mode 只写 "Normal"。双人分别占用 Left / Right，单人可用 Center；禁止两人同侧或 Center 与另一槽混用。
+- **始终维护在场名单与槽位**：models 是整场演员表，不是在场名单。只有 LayoutAppear 完成才在场，LayoutClear 完成才释放槽位；换背景/黑屏不清空名单。
+- **替换角色**：HideTalk → 旧角色 LayoutClear(wait:true) 完全淡出 → 新角色 LayoutAppear(wait:true) 在刚释放的同一槽淡入。禁止第三人先入场、交叉淡化重叠三人、瞬移或偷偷删除角色/台词。
+- Talk 的说话者和 actions 的目标都必须在场；旁白可用 modelId=-1，但不能给 -1 安排动作。
 
 ## 开场序列
 
 ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个角色一条 LayoutAppear
 
-LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.offset 为同侧外侧（Left:-100 / Right:+100 / Center:0），to.offset 为 0。入场动作与滑入同时进行，角色滑入到位、动作播完后才开始对话，无需额外初始化 Motion。**入场/退场动作必须选有明显肢体表现的动作（点头、开心、歪头等），禁止用 default 站姿类动作——站姿滑入等于站桩**。
+LayoutAppear 与 LayoutClear 都只做**原地淡入/淡出**：from 和 to 完全相同（同一 side、offset:0），moveSpeed="Normal"，wait:true。入场姿态按语境选自然动作/表情，平静站姿也可，不强迫夸张肢体。不要写画外 offset 或滑动换人。
 
 ## 对话规范
 
-- **说话者边说边做**：每条 Talk 的 data 必须带 motion（匹配台词语气）和 facial；禁止为说话者再加独立 Motion 片段
-- **非说话角色的反应**才用独立 Motion(wait:false)，插在对方 Talk 之间
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 24 项，每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：开头轻微姿态、关键词处变化、听者稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **自然、克制、有意义**：依据台词语义和人设选择清单中的动作；有情绪转折的长句可有 2~4 次变化，短句可不变。不要机关枪式切换、每句重播同一动作或强迫每条都有表演。允许安静倾听与停顿。
+- 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
+- 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
+- 动作/表情须来自对应 modelId 的完整名称，清单的前缀 * 只是分组，不是资源名；仅用明确列出的完整样例或默认值，不猜编号。
 - **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
 - 每个 Talk 含 content（中文）和 ttsText（日文翻译），排版必须遵守下方「台词排版硬规则」
 - 节奏自然，不必机械一人一句；话量跟随角色性格，不额外规定多少；排版拆条只是换行方式，不减少总话量
@@ -438,43 +467,20 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 
 ## 成片时长
 
-这是一场约 3 分钟的短戏（含开场滑入、对话、退场），不是长篇。口语节奏下整场大约三分钟说完就收：尽快入戏，说完一个完整小事件或一个情绪转折立刻退场。宁可略短，也不要写成能演很久的连续剧。禁止大段铺垫、多场景跳转、多人轮番独白、重复确认同一句意思。话量仍跟人设走，但整场体量必须按三分钟短戏来写。
+这是一场约 3 分钟的短戏（含开场淡入、对话、退场），不是长篇。口语节奏下整场大约三分钟说完就收：尽快入戏，说完一个完整小事件或一个情绪转折立刻退场。宁可略短，也不要写成能演很久的连续剧。禁止大段铺垫、多场景跳转、多人轮番独白、重复确认同一句意思。话量仍跟人设走，但整场体量必须按三分钟短戏来写。
 
 ## 退场序列
 
 剧情结束时在场角色必须依次带动画退场，禁止无动画消失或站到黑屏：
 
 1. HideTalk（wait:true, delay 0.2）
-2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from 为角色当前位置（同侧 offset 0），to 为**同侧外侧**（Left:-100 / Right:+100 / Center:100），moveSpeed 为 Normal，motion/facial 填退场动作与表情
+2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from/to 都等于角色当前槽位（offset:0），moveSpeed="Normal"，原地淡出；不要清除已离场角色
 3. BlackOut（duration 500~800）收尾。不使用 Telop。
 
-## 结构示例（条数不必照抄，只参考字段与顺序）
+## 结构示例（目录中的真实 ID/资源；只参考字段，不机械照抄表演）
 
 ```json
-{
-  "models": [
-    {example_models_block}
-  ],
-  "images": [
-    {"id":1,"image":"{example_bg}"}
-  ],
-  "snippets": [
-    {"type":"ChangeLayoutMode","wait":false,"delay":0,"data":{"mode":"Normal"}},
-    {"type":"BlackOut","wait":true,"delay":0,"data":{"duration":500}},
-    {"type":"ChangeBackgroundImage","wait":true,"delay":0,"data":{"imageId":1}},
-    {"type":"BlackIn","wait":true,"delay":0,"data":{"duration":800}},
-    {"type":"LayoutAppear","wait":true,"delay":0,"data":{"modelId":1,"from":{"side":"Left","offset":-100},"to":{"side":"Left","offset":0},"motion":"w-happy-glad01","facial":"face_smile_01","facialFirst":true,"moveSpeed":"Normal"}},
-    {"type":"LayoutAppear","wait":true,"delay":0.2,"data":{"modelId":2,"from":{"side":"Right","offset":100},"to":{"side":"Right","offset":0},"motion":"w-normal-default01","facial":"face_normal_01","facialFirst":true,"moveSpeed":"Normal"}},
-    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"角色A","content":"今天天气真好呢～一直闷在房间里也太无聊了。\n要不要出去走走？顺便买点喝的。","ttsText":"今日はいい天気だね～部屋にこもってるのも飽きたし。\nお散歩でも行かない？ついでに飲み物も買おうよ。","modelId":1,"voice":"1","motion":"w-happy-nod01","facial":"face_smile_01"}},
-    {"type":"Motion","wait":false,"delay":0.1,"data":{"modelId":2,"motion":"w-normal-nod01","facial":"face_smile_02","facialFirst":false}},
-    {"type":"Talk","wait":false,"delay":0,"data":{"speaker":"角色B","content":"嗯，正好我也想出去透透气。\n刚才画到一半卡住了，吹吹风说不定能想通。","ttsText":"うん、ちょうど外の空気を吸いたいと思ってた。\nさっき絵が行き詰まったし、風に当たれば思いつくかも。","modelId":2,"voice":"1","motion":"w-cool-tilthead01","facial":"face_normal_01"}},
-    {"type":"Motion","wait":false,"delay":0.15,"data":{"modelId":1,"motion":"w-cute-glad01","facial":"face_sparkling_01","facialFirst":false}},
-    {"type":"HideTalk","wait":true,"delay":0.2},
-    {"type":"LayoutClear","wait":true,"delay":0.1,"data":{"modelId":1,"from":{"side":"Left","offset":0},"to":{"side":"Left","offset":-100},"motion":"w-normal-default01","facial":"face_smile_01","moveSpeed":"Normal"}},
-    {"type":"LayoutClear","wait":true,"delay":0.1,"data":{"modelId":2,"from":{"side":"Right","offset":0},"to":{"side":"Right","offset":100},"motion":"w-normal-nod01","facial":"face_normal_01","moveSpeed":"Normal"}},
-    {"type":"BlackOut","wait":true,"delay":0,"data":{"duration":600}}
-  ]
-}
+{acting_example}
 ```
 
 ## 可用动作（按角色分组；必须用对应角色的完整动作名）
@@ -490,10 +496,10 @@ LayoutAppear **必须写 from 和 to 实现滑入**：from 与 to 同侧，from.
 
 ## 输出要求
 1. 只输出合法 JSON，无 markdown、无解释；仅含 models、images、snippets
-2. 开场与退场序列完整；LayoutAppear 必须写 from/to 滑入
+2. 开场与退场序列完整；LayoutAppear/LayoutClear 原地淡入淡出，from/to 相同、wait:true、moveSpeed="Normal"；任意时刻最多两人在场
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
-5. 每条 Talk 含 content、ttsText、motion、facial（动作表情来自该角色清单）
+5. 每条 Talk 含 content、ttsText；有需要才写 actions，包含说话者及在场听者的时序变化；动作/表情必须来自各自角色清单
 6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 26 字宽、每条最多 3 行；超行拆成连续多条 Talk，话量不减
 7. delay 用 0、0.05、0.1、0.15、0.2
 8. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
@@ -526,8 +532,11 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **说话者边说边做**：动作/表情写在 Talk 的 motion/facial 字段（与说话同时进行），必须来自所选角色的可用清单
-- 独立 Motion（wait:false）只用于句间附加反应
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 24 项，每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的点头/疑惑/缓和。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- 有转折的长句可有 2~4 次变化，短句可安静维持姿态；不是每条必须动。按台词意义和人设选择，不机关枪式换动作、不机械重复。保留自然停顿与倾听。
+- 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
+- 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
 - 可用动作：{motion_list}
 - 可用表情：{facial_list}
 
@@ -546,36 +555,32 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 4. 每条 Talk **最多 3 行**（最多 2 个 \n）——这只是排版规则，**不是话量限制**：话多的角色照样多说，把话**拆成同角色的连续多条 Talk**（delay 取 0.15~0.2）即可；禁止为了塞进一条而删减、缩短台词，也禁止写出超过 3 行的单条 Talk
 5. ttsText 的换行位置与 content 保持一致
 
-开场滑入 + 对话 + 结尾退场：
+开场淡入 + 对话表演 + 结尾淡出：
 ```
-ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear -> [Talk(+ Motion 反应)]... -> HideTalk -> LayoutClear -> BlackOut
+ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear -> Talk(actions)... -> HideTalk -> LayoutClear -> BlackOut
 ```
 
-**开场滑入（LayoutAppear 必须写 from 和 to）**：
-- 单人：from 为 {"side": "Right", "offset": 100}，to 为 {"side": "Center", "offset": 0}
-- 双人：先登场 from {"side": "Left", "offset": -100} to {"side": "Left", "offset": 0}，后登场 from {"side": "Right", "offset": 100} to {"side": "Right", "offset": 0}，禁止两人同侧或同为 Center
-- motion/facial 即入场动作，滑入到位后再开始对话，无需额外初始化 Motion。入场动作选有明显肢体表现的，禁止 default 站姿滑入。
+**舞台与替换规则**：
+- ChangeLayoutMode.data.mode 只写 "Normal"。单人用 Center，两人用 Left / Right，不能同侧，也不能 Center 与另一槽混用。
+- 始终维护在场名单：models 是整场演员表，不是在场名单。任意时刻最多两人；只有 LayoutAppear 完成才在场，LayoutClear 完成才释放槽位。背景/黑屏不会清除角色。
+- LayoutAppear/LayoutClear 均为原地淡入/淡出：from 和 to 完全相同（同侧、offset:0）、moveSpeed="Normal"、wait:true，不用滑动/画外位置。自然站姿亦可，不强迫夸张动作。
+- 换人必须 HideTalk → 旧角色 LayoutClear(wait:true) 完全淡出 → 新角色在已释放槽位 LayoutAppear(wait:true) 淡入；禁止第三人先出现或两次渐变重叠成三人在场。
+- Talk 和 actions 只指向已入场角色；旁白可用 modelId=-1，但不能给 -1 配动作。
 
 **结尾退场序列（缺一不可）：**
-1. HideTalk（wait: true, delay 0.2）
-2. 每个在场角色一条 LayoutClear（wait: true, delay 0.1）：from 为角色当前位置（offset 0），to 为同侧外侧（Center:100 / Left:-100 / Right:+100），moveSpeed 为 Normal
-3. BlackOut（wait: true, duration 600）。不使用 Telop。
+1. HideTalk（wait:true, delay:0.2）
+2. 每个仍在场角色 LayoutClear（wait:true, delay:0.1），from/to 均为当前位置，moveSpeed="Normal"
+3. BlackOut（wait:true, duration:600）。不使用 Telop。
 
-### 结构示例（单人，条数不必照抄）
-{"type": "ChangeLayoutMode", "wait": false, "delay": 0, "data": {"mode": "Normal"}},
-{"type": "BlackOut", "wait": true, "delay": 0, "data": {"duration": 500}},
-{"type": "ChangeBackgroundImage", "wait": true, "delay": 0, "data": {"imageId": 1}},
-{"type": "BlackIn", "wait": true, "delay": 0, "data": {"duration": 800}},
-{"type": "LayoutAppear", "wait": true, "delay": 0, "data": {"modelId": 1, "from": {"side": "Right", "offset": 100}, "to": {"side": "Center", "offset": 0}, "motion": "<所选角色的动作>", "facial": "<所选角色的表情>", "facialFirst": true, "moveSpeed": "Normal"}},
-{"type": "Talk", "wait": false, "delay": 0, "data": {"speaker": "<所选角色名>", "content": "你好呀！刚才还在想你会不会来呢。\n今天有点闲，正好想找人说说话。", "ttsText": "やっほー！さっきから来るかなって思ってたんだ。\n今日は暇だし、ちょうど誰かと話したかった。", "modelId": 1, "voice": "1", "motion": "<该角色的动作>", "facial": "<该角色的表情>"}},
-{"type": "HideTalk", "wait": true, "delay": 0.2},
-{"type": "LayoutClear", "wait": true, "delay": 0.1, "data": {"modelId": 1, "from": {"side": "Center", "offset": 0}, "to": {"side": "Right", "offset": 100}, "motion": "<该角色的退场动作>", "facial": "<该角色的退场表情>", "moveSpeed": "Normal"}},
-{"type": "BlackOut", "wait": true, "delay": 0, "data": {"duration": 600}}
+### 结构示例（目录真实资源；单人时省去听者动作，勿机械照抄）
+```json
+{acting_example}
+```
 
 ## 输出要求
 1. 只输出合法 JSON，无额外文字；仅含 models、images、snippets
-2. 开场与退场序列完整；LayoutAppear 必须写 from/to 滑入
-3. speaker 与 modelId 必须来自对照表；每条 Talk 必须带 motion 和 facial
+2. 开场与退场序列完整；LayoutAppear/LayoutClear 原地淡入淡出，from/to 相同、wait:true、moveSpeed="Normal"；任意时刻最多两人在场
+3. speaker 与 modelId 必须来自对照表；actions 可选，按语义安排说话者和在场听者的变化，不要求每句重复动作
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
@@ -1176,6 +1181,53 @@ class MySekaiStorytellerPlugin(Star):
             blocks.append(f"{header}\n{prompt if prompt else GENERIC_PROFILE_TEXT}")
         return "\n\n".join(blocks) if blocks else "（资源目录为空，请检查渲染宿主）"
 
+    @staticmethod
+    def _build_acting_example(view) -> str:
+        """生成与当前目录 ID/资源一致的最小双人/单人示例，避免 prompt 写死 modelId。"""
+        models = view.models[:2] or [view.default_model()]
+        ids = [m.get("id") for m in models]
+        entries = [
+            {"id": m.get("id"), "model": m.get("path"), "normal_scale": 2.1,
+             "small_scale": 1.8, "anchor": 0.5} for m in models
+        ]
+        def action(model_id, at, field):
+            m = view.model_by_id(model_id) or view.default_model()
+            values = m.get("motions" if field == "motion" else "facials") or []
+            fallback = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
+            return {"at": at, "modelId": model_id, field: values[0] if values else fallback}
+        if len(ids) == 1:
+            side = "Center"
+            talk_actions = [action(ids[0], 0.35, "motion")]
+            appears = [{"type": "LayoutAppear", "wait": True, "delay": 0,
+                        "data": {"modelId": ids[0], "from": {"side": side, "offset": 0},
+                                 "to": {"side": side, "offset": 0},
+                                 "motion": view.default_motion(ids[0]), "facial": view.default_facial(ids[0]),
+                                 "facialFirst": True, "moveSpeed": "Normal"}}]
+        else:
+            first, second = ids
+            appears = []
+            for model_id, side in ((first, "Left"), (second, "Right")):
+                appears.append({"type": "LayoutAppear", "wait": True, "delay": 0,
+                                "data": {"modelId": model_id, "from": {"side": side, "offset": 0},
+                                         "to": {"side": side, "offset": 0},
+                                         "motion": view.default_motion(model_id), "facial": view.default_facial(model_id),
+                                         "facialFirst": True, "moveSpeed": "Normal"}})
+            talk_actions = [action(first, 0.25, "motion"), action(second, 0.65, "facial")]
+        snippets = [{"type": "ChangeLayoutMode", "wait": False, "delay": 0, "data": {"mode": "Normal"}},
+                    *appears,
+                    {"type": "Talk", "wait": False, "delay": 0,
+                     "data": {"speaker": view.short_name(models[0]), "content": "你好。", "ttsText": "こんにちは。",
+                              "modelId": ids[0], "actions": talk_actions}},
+                    {"type": "HideTalk", "wait": True, "delay": 0.2},
+                    *[{"type": "LayoutClear", "wait": True, "delay": 0.1,
+                       "data": {"modelId": m.get("id"), "from": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"), "offset": 0},
+                                "to": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"), "offset": 0},
+                                "motion": view.default_motion(m.get("id")), "facial": view.default_facial(m.get("id")), "moveSpeed": "Normal"}}
+                      for i, m in enumerate(models)],
+                    {"type": "BlackOut", "wait": True, "delay": 0, "data": {"duration": 600}}]
+        return json.dumps({"models": entries, "images": [{"id": 1, "image": view.default_image()}],
+                           "snippets": snippets}, ensure_ascii=False)
+
     async def _build_prompt(self, scene: str) -> tuple[str, str]:
         """构建系统提示词和用户提示词（剧本模式）"""
         system_prompt = "你是视觉小说导演。只输出合法 JSON（仅含 models、images、snippets），不要 markdown 或解释。写成约 3 分钟的短戏，禁止超长剧情；对话多少按角色人设自行把握。"
@@ -1185,15 +1237,11 @@ class MySekaiStorytellerPlugin(Star):
         view = self._catalog.view()
         registry = self._persona_registry(view)
 
-        default_model_id = view.default_model().get("id", 1)
-        second_model_id = view.models[1]["id"] if len(view.models) > 1 else default_model_id
-
         user_prompt = _fill_template(self.prompt_template, {
             "{character_pool}": self._build_character_pool(registry),
             "{model_table}": view.model_table(),
             "{id_mapping}": view.id_mapping(),
-            "{example_models_block}": view.example_models_block([default_model_id, second_model_id]),
-            "{example_bg}": view.default_image(),
+            "{acting_example}": self._build_acting_example(view),
             "{motion_list}": view.motion_list(),
             "{facial_list}": view.facial_list(),
             "{image_list}": view.image_list(),
@@ -1226,6 +1274,7 @@ class MySekaiStorytellerPlugin(Star):
 
         user_prompt = _fill_template(CHAT_MODE_PROMPT_TEMPLATE, {
             "{persona_pool}": self._build_character_pool(registry),
+            "{acting_example}": self._build_acting_example(view),
             "{model_table}": view.model_table(),
             "{id_mapping}": view.id_mapping(),
             "{motion_list}": view.motion_list(),
@@ -1349,7 +1398,95 @@ class MySekaiStorytellerPlugin(Star):
 
     VALID_SIDES = {"Center", "Left", "Right"}
     VALID_MOVE_SPEEDS = {"Slow", "Normal", "Fast", "Immediate"}
-    VALID_LAYOUT_MODES = {"Normal", "Three"}
+    VALID_LAYOUT_MODES = {"Normal"}
+
+    @staticmethod
+    def _animation_choices(view, model_id, field: str) -> set:
+        """目录为空时只放行已知默认值，不把空白名单当作任意资源可用。"""
+        if field == "motion":
+            return view.valid_motions(model_id) or {view.default_motion(model_id)}
+        return view.valid_facials(model_id) or {view.default_facial(model_id)}
+
+    def _validate_actions(self, data: dict, view, model_ids: set, label: str) -> None:
+        if "actions" not in data:
+            return
+        actions = data["actions"]
+        if not isinstance(actions, list) or len(actions) > 24:
+            raise ValueError(f"{label}.actions 必须是最多 24 项的数组")
+        normalized = []
+        for index, action in enumerate(actions):
+            where = f"{label}.actions[{index}]"
+            if not isinstance(action, dict) or set(action) - {"at", "modelId", "motion", "facial"}:
+                raise ValueError(f"{where} 只能包含 at/modelId/motion/facial")
+            at = action.get("at")
+            if type(at) not in (int, float) or not math.isfinite(at) or not 0 <= at <= 1:
+                raise ValueError(f"{where}.at 必须是 0..1 的有限数字（时长比例）")
+            model_id = action.get("modelId")
+            if type(model_id) is not int or model_id not in model_ids:
+                raise ValueError(f"{where}.modelId 必须是 models 中的角色整数 ID")
+            cleaned = {"at": at, "modelId": model_id}
+            for field in ("motion", "facial"):
+                if field not in action:
+                    continue
+                value = action[field]
+                if not isinstance(value, str) or value not in self._animation_choices(view, model_id, field):
+                    raise ValueError(f"{where}.{field} 必须是该角色资源清单中的完整名称")
+                cleaned[field] = value
+            if len(cleaned) == 2:
+                raise ValueError(f"{where} 至少需要一个 motion 或 facial")
+            normalized.append(cleaned)
+        data["actions"] = sorted(normalized, key=lambda action: action["at"])
+
+    def _normalize_scene(self, story_data: dict) -> None:
+        """插件的舞台约束；非法换人交给原有 LLM 重试，不删台词、不代选退场者。"""
+        visible: dict[int, dict] = {}
+        mode = None
+        for index, snippet in enumerate(story_data["snippets"]):
+            kind = snippet["type"]
+            data = snippet.get("data", {})
+            model_id = data.get("modelId")
+            label = f"snippets[{index}] {kind}"
+            if kind == "ChangeLayoutMode":
+                mode = data.get("mode", "Normal")
+                if mode not in self.VALID_LAYOUT_MODES | {"One", "Two"} or (mode == "One" and len(visible) > 1):
+                    raise ValueError(f"{label} 只允许 Normal 下的单人/双人舞台，切换前须让多余角色退场")
+                # One/Two 仅容错识别为意图，宿主实际只接收 Normal。
+                data["mode"] = "Normal"
+            elif kind == "LayoutAppear":
+                if model_id in visible:
+                    raise ValueError(f"{label} 角色已在场，不能重复入场")
+                if len(visible) >= 2 or (mode == "One" and visible):
+                    raise ValueError(f"{label} 同时最多两人在场；先 LayoutClear(wait:true) 完全淡出旧角色再入场")
+                position = {"side": data["to"]["side"], "offset": 0}
+                if any(p["side"] == position["side"] or "Center" in (p["side"], position["side"]) for p in visible.values()):
+                    raise ValueError(f"{label} 双人必须占用不同的 Left/Right 槽位")
+                data["from"], data["to"] = dict(position), dict(position)
+                data["moveSpeed"], snippet["wait"] = "Normal", True
+                visible[model_id] = position
+            elif kind in {"LayoutClear", "Move"}:
+                if model_id not in visible:
+                    raise ValueError(f"{label} 角色不在场")
+                data["from"] = dict(visible[model_id])
+                snippet["wait"] = True
+                if kind == "LayoutClear":
+                    data["to"] = dict(visible.pop(model_id))
+                    data["moveSpeed"] = "Normal"
+                else:
+                    position = data["to"]
+                    if any(other != model_id and (p["side"] == position["side"] or "Center" in (p["side"], position["side"])) for other, p in visible.items()):
+                        raise ValueError(f"{label} 不能移入已占用的槽位")
+                    visible[model_id] = dict(position)
+            elif kind in {"Talk", "Motion", "DoParam"}:
+                if not (kind == "Talk" and model_id == -1) and model_id not in visible:
+                    raise ValueError(f"{label} 说话/动作角色必须已入场且未退场")
+                if kind == "Talk" and model_id == -1 and (data.get("motion") or data.get("facial")):
+                    raise ValueError(f"{label} 旁白不能播放角色动作")
+                for action in data.get("actions", []):
+                    if action["modelId"] not in visible:
+                        raise ValueError(f"{label}.actions 的角色 {action['modelId']} 不在场，不能表演听者反应")
+                # 静默片段完成后才能换人；听者在说话期间的反应只能放在 Talk.actions。
+                if kind == "Motion" and "actions" in data:
+                    snippet["wait"] = True
 
     @staticmethod
     def _split_tts_text(tts: str, group_count: int) -> list[str]:
@@ -1370,9 +1507,14 @@ class MySekaiStorytellerPlugin(Star):
                 idx += take
             return buckets
         if line_parts:
-            buckets = [""] * group_count
-            for i, seg in enumerate(line_parts):
-                buckets[i % group_count] = (buckets[i % group_count] + seg).strip()
+            # 保持原文连续顺序，不能按轮转分桶（否则 1/3/5 会跑到 2/4/6 前）。
+            base, extra = divmod(len(line_parts), group_count)
+            buckets = []
+            index = 0
+            for i in range(group_count):
+                take = base + (1 if i < extra else 0)
+                buckets.append("\n".join(line_parts[index:index + take]))
+                index += take
             return buckets
         return [""] * group_count
 
@@ -1380,8 +1522,8 @@ class MySekaiStorytellerPlugin(Star):
     def _split_overflow_talks(cls, story_data: dict) -> dict:
         """把超过 TALK_MAX_LINES 行的 Talk 拆成同角色的连续多条，台词一字不丢。
 
-        排版上限只决定"怎么拆"，不减少总话量：拆出的 Talk 保留同一说话人/
-        modelId/voice/motion/facial，delay 取 0.15 形成自然接续。
+        排版上限只决定"怎么拆"，不减少总话量：保留说话人/modelId/voice；
+        actions 按文本时长比例分段重映射，旧标量仅首条播放，后续 delay 取 0.15。
         """
         snippets = story_data.get("snippets")
         if not isinstance(snippets, list):
@@ -1400,18 +1542,34 @@ class MySekaiStorytellerPlugin(Star):
 
             groups = [lines[i:i + TALK_MAX_LINES] for i in range(0, len(lines), TALK_MAX_LINES)]
             tts_groups = cls._split_tts_text(str(data.get("ttsText") or ""), len(groups))
+            # TTS 时长尚未由宿主解析，用连续文本字宽近似分配时间；每个事件只归属一条。
+            weights = [max(1.0, sum(_char_width_units(ch) for line in group for ch in line)) for group in groups]
+            total = sum(weights)
+            start = 0.0
             for gi, group in enumerate(groups):
+                end = start + weights[gi] / total if gi < len(groups) - 1 else 1.0
+                part_data = copy.deepcopy(data)
+                part_data.update(content="\n".join(group), ttsText=tts_groups[gi])
+                if "actions" in data:
+                    part_data["actions"] = []
+                    for action in data["actions"]:
+                        at = action["at"]
+                        if start <= at < end or (gi == len(groups) - 1 and at == 1):
+                            event = copy.deepcopy(action)
+                            event["at"] = min(1.0, max(0.0, (at - start) / (end - start)))
+                            part_data["actions"].append(event)
+                if gi:
+                    # 旧标量只在原台词起点播放，不因分页重复点头/重置表情。
+                    part_data["motion"] = ""
+                    part_data["facial"] = ""
                 part = {
                     "type": "Talk",
-                    "wait": False,
+                    "wait": snippet.get("wait", False),
                     "delay": snippet.get("delay", 0) if gi == 0 else 0.15,
-                    "data": {
-                        **data,
-                        "content": "\n".join(group),
-                        "ttsText": tts_groups[gi],
-                    },
+                    "data": part_data,
                 }
                 result.append(part)
+                start = end
             logger.info(f"Talk 超过 {TALK_MAX_LINES} 行，已拆分为 {len(groups)} 条保留完整台词")
 
         story_data["snippets"] = result
@@ -1424,19 +1582,26 @@ class MySekaiStorytellerPlugin(Star):
 
         view = self._catalog_view()
 
-        # 确保 models 是数组，为空则填充默认模型
-        if "models" not in story_data or not isinstance(story_data.get("models"), list) or len(story_data["models"]) == 0:
-            story_data["models"] = [{"id": 1, "model": view.default_model_path(), "normal_scale": 2.1, "small_scale": 1.8, "anchor": 0.5}]
-        else:
-            for i, model in enumerate(story_data["models"]):
-                if not isinstance(model, dict):
-                    story_data["models"][i] = {"id": i + 1, "model": view.default_model_path(), "normal_scale": 2.1, "small_scale": 1.8, "anchor": 0.5}
-                    continue
-                model["id"] = self._to_number(model.get("id"), i + 1)
-                model["model"] = self._fix_model_path(model.get("model", ""))
-                model["normal_scale"] = self._to_number(model.get("normal_scale"), 2.1)
-                model["small_scale"] = self._to_number(model.get("small_scale"), 1.8)
-                model["anchor"] = self._to_number(model.get("anchor"), 0.5)
+        # modelId 绑定目录角色，不能出现同 ID 多模型或路径与 ID 指向不同角色。
+        default_id = view.default_model().get("id", 1)
+        if not isinstance(story_data.get("models"), list) or not story_data["models"]:
+            story_data["models"] = [{"id": default_id, "model": view.default_model_path()}]
+        model_ids = set()
+        for i, model in enumerate(story_data["models"]):
+            if not isinstance(model, dict):
+                raise ValueError(f"models[{i}] 必须是角色对象")
+            raw_id = model.get("id", default_id)
+            model_id = self._to_number(raw_id, -1)
+            if isinstance(raw_id, bool) or not math.isfinite(model_id) or int(model_id) != model_id or not view.model_by_id(model_id):
+                raise ValueError(f"models[{i}].id 必须来自角色目录")
+            if model_id in model_ids:
+                raise ValueError(f"models[{i}].id 重复: {model_id}")
+            model_ids.add(model_id)
+            model["id"] = int(model_id)
+            model["model"] = view.model_by_id(model_id)["path"]
+            model["normal_scale"] = self._to_number(model.get("normal_scale"), 2.1)
+            model["small_scale"] = self._to_number(model.get("small_scale"), 1.8)
+            model["anchor"] = self._to_number(model.get("anchor"), 0.5)
 
         # 确保 images 是数组，为空则填充默认背景
         if "images" not in story_data or not isinstance(story_data.get("images"), list) or len(story_data["images"]) == 0:
@@ -1459,23 +1624,28 @@ class MySekaiStorytellerPlugin(Star):
         valid_types = set(SNIPPET_SCHEMAS.keys())
 
         for i, snippet in enumerate(story_data["snippets"]):
-            if not isinstance(snippet, dict):
-                continue
-
-            if "type" not in snippet:
-                continue
-
+            if not isinstance(snippet, dict) or not isinstance(snippet.get("type"), str) or snippet["type"] not in valid_types:
+                raise ValueError(f"snippets[{i}] 必须是有效类型的片段对象")
             snippet_type = snippet["type"]
-            if snippet_type not in valid_types:
-                logger.warning(f"Snippet {i} 的 type '{snippet_type}' 无效，已跳过")
-                continue
-
             snippet["wait"] = self._to_bool(snippet.get("wait"), False)
             snippet["delay"] = self._to_number(snippet.get("delay"), 0)
+            if not math.isfinite(snippet["delay"]) or snippet["delay"] < 0:
+                raise ValueError(f"snippets[{i}].delay 必须是非负有限秒数")
 
-            needs_data = snippet_type in SNIPPET_SCHEMAS and "data" in SNIPPET_SCHEMAS[snippet_type].get("properties", {})
-            if needs_data and "data" not in snippet:
-                snippet["data"] = {}
+            needs_data = "data" in SNIPPET_SCHEMAS[snippet_type].get("properties", {})
+            if needs_data:
+                snippet.setdefault("data", {})
+                if not isinstance(snippet["data"], dict):
+                    raise ValueError(f"snippets[{i}].data 必须是对象")
+            if snippet_type in {"Talk", "Motion", "LayoutAppear", "LayoutClear", "Move", "DoParam"}:
+                data = snippet["data"]
+                raw_id = data.get("modelId", default_id)
+                model_id = self._to_number(raw_id, -2)
+                if isinstance(raw_id, bool) or not math.isfinite(model_id) or int(model_id) != model_id or (model_id not in model_ids and not (snippet_type == "Talk" and model_id == -1)):
+                    raise ValueError(f"snippets[{i}].modelId 必须是 models 中的角色整数 ID（旁白 Talk 可用 -1）")
+                data["modelId"] = int(model_id)
+                if snippet_type in {"Talk", "Motion"}:
+                    self._validate_actions(data, view, model_ids, f"snippets[{i}]")
 
             if snippet_type == "Talk":
                 data = snippet.get("data", {})
@@ -1505,6 +1675,9 @@ class MySekaiStorytellerPlugin(Star):
                 model_id = data["modelId"]
                 data["motion"] = self._to_str(data.get("motion"), view.default_motion(model_id))
                 data["facial"] = self._to_str(data.get("facial"), view.default_facial(model_id))
+                for field in ("motion", "facial"):
+                    if data[field] not in self._animation_choices(view, model_id, field):
+                        data[field] = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
                 data["facialFirst"] = self._to_bool(data.get("facialFirst"), True)
                 data["moveSpeed"] = self._to_str(data.get("moveSpeed"), "Normal")
                 if data["moveSpeed"] not in self.VALID_MOVE_SPEEDS:
@@ -1516,16 +1689,8 @@ class MySekaiStorytellerPlugin(Star):
                 if data["to"]["side"] not in self.VALID_SIDES:
                     data["to"]["side"] = "Left"
                 data["to"]["offset"] = self._to_number(data["to"].get("offset"), 0)
-                # 入场必须滑入：from 缺失时按 to.side 推导同侧外侧起点（动作与滑入并发）
-                entrance_offset = {"Left": -100, "Right": 100, "Center": 0}.get(
-                    data["to"]["side"], 0
-                )
-                if "from" not in data or not isinstance(data.get("from"), dict):
-                    data["from"] = {"side": data["to"]["side"], "offset": entrance_offset}
-                data["from"]["side"] = self._to_str(data["from"].get("side"), data["to"]["side"])
-                if data["from"]["side"] not in self.VALID_SIDES:
-                    data["from"]["side"] = data["to"]["side"]
-                data["from"]["offset"] = self._to_number(data["from"].get("offset"), entrance_offset)
+                # 舞台阶段统一为原地淡入，不保留旧的滑入起点。
+                data["from"] = dict(data["to"])
                 snippet["data"] = data
 
             elif snippet_type == "LayoutClear":
@@ -1541,16 +1706,8 @@ class MySekaiStorytellerPlugin(Star):
                 if data["from"]["side"] not in self.VALID_SIDES:
                     data["from"]["side"] = "Center"
                 data["from"]["offset"] = self._to_number(data["from"].get("offset"), 0)
-                # 退场必须滑出：to 缺失时按 from.side 推导同侧外侧终点
-                exit_offset = {"Left": -100, "Right": 100, "Center": 100}.get(
-                    data["from"]["side"], 100
-                )
-                if "to" not in data or not isinstance(data.get("to"), dict):
-                    data["to"] = {"side": data["from"]["side"], "offset": exit_offset}
-                data["to"]["side"] = self._to_str(data["to"].get("side"), data["from"]["side"])
-                if data["to"]["side"] not in self.VALID_SIDES:
-                    data["to"]["side"] = data["from"]["side"]
-                data["to"]["offset"] = self._to_number(data["to"].get("offset"), exit_offset)
+                # 退场也原地淡出；_normalize_scene 会覆盖为当前追踪槽位。
+                data["to"] = dict(data["from"])
                 # 退场动作/表情：非法值回退该角色默认（退场必须有动作，禁止无动画消失）
                 clear_motion = self._clean_path(self._to_str(data.get("motion"), ""))
                 if not clear_motion:
@@ -1572,14 +1729,18 @@ class MySekaiStorytellerPlugin(Star):
                 data = snippet.get("data", {})
                 data["modelId"] = self._to_number(data.get("modelId"), 1)
                 model_id = data["modelId"]
-                valid_motions = view.valid_motions(model_id)
-                valid_facials = view.valid_facials(model_id)
-                motion = self._to_str(data.get("motion"), view.default_motion(model_id))
-                facial = self._to_str(data.get("facial"), view.default_facial(model_id))
-                if valid_motions and motion not in valid_motions:
+                has_actions = "actions" in data
+                if has_actions or "duration" in data:
+                    duration = data.get("duration", 2)
+                    if type(duration) not in (int, float) or not math.isfinite(duration) or not 0 < duration <= 120:
+                        raise ValueError(f"snippets[{i}].duration 必须是大于 0 且不超过 120 的有限秒数")
+                    data["duration"] = duration
+                motion = self._to_str(data.get("motion"), "" if has_actions else view.default_motion(model_id))
+                facial = self._to_str(data.get("facial"), "" if has_actions else view.default_facial(model_id))
+                if motion and motion not in self._animation_choices(view, model_id, "motion"):
                     logger.warning(f"Motion '{motion}' not available for {view.name_by_id(model_id)}, falling back to {view.default_motion(model_id)}")
                     motion = view.default_motion(model_id)
-                if valid_facials and facial not in valid_facials:
+                if facial and facial not in self._animation_choices(view, model_id, "facial"):
                     logger.warning(f"Facial '{facial}' not available for {view.name_by_id(model_id)}, falling back to {view.default_facial(model_id)}")
                     facial = view.default_facial(model_id)
                 data["motion"] = motion
@@ -1630,8 +1791,6 @@ class MySekaiStorytellerPlugin(Star):
             elif snippet_type == "ChangeLayoutMode":
                 data = snippet.get("data", {})
                 data["mode"] = self._to_str(data.get("mode"), "Normal")
-                if data["mode"] not in self.VALID_LAYOUT_MODES:
-                    data["mode"] = "Normal"
                 snippet["data"] = data
 
             elif snippet_type == "DoParam":
@@ -1641,6 +1800,8 @@ class MySekaiStorytellerPlugin(Star):
                     data["params"] = []
                 snippet["data"] = data
 
+        # 先验证原时间线；不通过时由已有生成流程请求 LLM 修正，不删除角色/台词。
+        self._normalize_scene(story_data)
         # 排版收尾：超行 Talk 拆成连续多条，台词不删减
         story_data = self._split_overflow_talks(story_data)
         return story_data
