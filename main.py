@@ -449,9 +449,9 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**说话的人 1~2 个动作、不说话的人 0~1 个动作**（最多 3 项），每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义做手势或表情转折（相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒）；听者稍后点头/疑惑/缓和，一条至多 1 次。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **动作要有语义，宁缺毋滥**：每个动作都要贴台词内容或情绪转折（说到某物时指一指、被戳中时惊讶、安心时松口气），禁止无意义的装饰性动作；没有贴合的动作就干脆不写。**不是每条台词都要动**：整场带 actions 的台词不超过三分之一，短句、平静语气、过渡句一律不安排。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人一句内可连续安排 2~4 个动作/表情，不说话的人也可以做表情和动作（至多 2 个），每句合计最多 6 项，每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义连续做手势和表情转折（相邻 at 间隔 ≥0.25）；听者在对方说话时也可以做表情和动作，稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **动作要有语义**：每个动作都要贴台词内容或情绪转折（说到某物时指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；禁止与台词无关的乱动。表情跟随情绪转折而非逐句重置；禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
 - 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
@@ -503,7 +503,7 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
-5. 每条 Talk 含 content、ttsText；有需要才写 actions，包含说话者及在场听者的时序变化；动作/表情必须来自各自角色清单
+5. 每条 Talk 含 content、ttsText；**每条都必须写 actions**（说话的人 2~4 个、不说话的人 0~2 个）；动作/表情必须来自各自角色清单
 6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 26 字宽、每条最多 3 行；超行拆成连续多条 Talk，话量不减
 7. delay 用 0、0.05、0.1、0.15、0.2
 8. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
@@ -536,9 +536,9 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**说话的人 1~2 个动作、不说话的人 0~1 个动作**（最多 3 项），每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
-- **动作要有语义，宁缺毋滥**：动作要贴说话内容或情绪转折，禁止无意义的装饰性动作；没有贴合的动作就干脆不写，不是每条都要动。保留自然停顿与倾听，不机关枪式换动作、不机械重复。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人一句内可连续安排 2~4 个动作/表情，不说话的人也可以做表情和动作（至多 2 个），每句合计最多 6 项，每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者连续的语义手势、表情转折，以及听者的表情和动作反应。相邻 at 间隔 ≥0.25。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- **动作要有语义**：动作要贴说话内容或情绪转折（说到某物指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；禁止与台词无关的乱动，不机关枪式换动作、不每句重播同一动作。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
@@ -587,7 +587,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 ## 输出要求
 1. 只输出合法 JSON，无额外文字；仅含 models、images、snippets
 2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
-3. speaker 与 modelId 必须来自对照表；actions 可选，按语义安排说话者和在场听者的变化，不要求每句重复动作
+3. speaker 与 modelId 必须来自对照表；**每句 Talk 都要写 actions**（说话的人 2~4 个、不说话的人 0~2 个），按语义连续安排变化
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
@@ -1210,7 +1210,7 @@ class MySekaiStorytellerPlugin(Star):
             fallback = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
             return {"at": at, "modelId": model_id, field: values[0] if values else fallback}
         if len(ids) == 1:
-            talk_actions = [action(ids[0], 0.35, "motion")]
+            talk_actions = [action(ids[0], 0.2, "motion"), action(ids[0], 0.6, "facial")]
             appears = [{"type": "LayoutAppear", "wait": True, "delay": 0,
                         "data": {"modelId": ids[0], "from": {"side": "Right", "offset": 100},
                                  "to": {"side": "Center", "offset": 0},
@@ -1225,7 +1225,7 @@ class MySekaiStorytellerPlugin(Star):
                                          "to": {"side": side, "offset": 0},
                                          "motion": stage_motion(model_id), "facial": view.default_facial(model_id),
                                          "facialFirst": True, "moveSpeed": "Normal"}})
-            talk_actions = [action(first, 0.3, "motion")]
+            talk_actions = [action(first, 0.2, "motion"), action(first, 0.5, "facial"), action(second, 0.8, "facial")]
         snippets = [{"type": "ChangeLayoutMode", "wait": False, "delay": 0, "data": {"mode": "Normal"}},
                     *appears,
                     {"type": "Talk", "wait": False, "delay": 0,
@@ -1445,11 +1445,11 @@ class MySekaiStorytellerPlugin(Star):
         if "actions" not in data:
             return
         actions = data["actions"]
-        # 表演节奏硬约束（超出直接裁掉，不触发整场重试）：说话者一条内至多 2 处变化、
-        # 听者类事件（非说话者目标）一条至多 1 处、同一角色相邻变化至少隔 0.3。
+        # 单句表演配额兜底（超出直接裁掉，不触发整场重试）：说话者一句内可连续演，至多 4 处变化、
+        # 听者类事件（非说话者目标）至多 2 处、同一角色相邻变化至少隔 0.2。
         # 渲染层仍允许手工剧本最多 24 项，这里只约束插件产出。
-        if not isinstance(actions, list) or len(actions) > 6:
-            raise ValueError(f"{label}.actions 必须是最多 6 项的数组（动作是点缀，不要频繁切换）")
+        if not isinstance(actions, list) or len(actions) > 8:
+            raise ValueError(f"{label}.actions 必须是最多 8 项的数组")
         normalized = []
         for index, action in enumerate(actions):
             where = f"{label}.actions[{index}]"
@@ -1480,16 +1480,16 @@ class MySekaiStorytellerPlugin(Star):
         kept: list[dict] = []
         for actor_id, items in by_model.items():
             is_listener = actor_id != speaker_id
-            cap = 1 if is_listener else 2
-            cap_name = "听者反应至多 1 处" if is_listener else "同一角色至多 2 处变化"
+            cap = 2 if is_listener else 4
+            cap_name = "听者反应至多 2 处" if is_listener else "同一角色至多 4 处变化"
             last_at = None
             count = 0
             for action in items:
                 if count >= cap:
                     logger.info(f"{label}.actions {cap_name}，已裁掉 {action.get('motion') or action.get('facial')}")
                     continue
-                if last_at is not None and action["at"] - last_at < 0.3:
-                    logger.info(f"{label}.actions 同一角色相邻变化间隔过近（<0.3），已裁掉 {action.get('motion') or action.get('facial')}")
+                if last_at is not None and action["at"] - last_at < 0.2:
+                    logger.info(f"{label}.actions 同一角色相邻变化间隔过近（<0.2），已裁掉 {action.get('motion') or action.get('facial')}")
                     continue
                 kept.append(action)
                 last_at = action["at"]
