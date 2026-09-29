@@ -435,20 +435,23 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 - ChangeLayoutMode.data.mode 只写 "Normal"。双人分别占用 Left / Right，单人可用 Center；禁止两人同侧或 Center 与另一槽混用。
 - **始终维护在场名单与槽位**：models 是整场演员表，不是在场名单。只有 LayoutAppear 完成才在场，LayoutClear 完成才释放槽位；换背景/黑屏不清空名单。
-- **替换角色**：HideTalk → 旧角色 LayoutClear(wait:true) 完全淡出 → 新角色 LayoutAppear(wait:true) 在刚释放的同一槽淡入。禁止第三人先入场、交叉淡化重叠三人、瞬移或偷偷删除角色/台词。
+- **替换角色**：HideTalk → 旧角色 LayoutClear(wait:true) 完全滑出 → 新角色 LayoutAppear(wait:true) 从画外滑入刚释放的同一槽。禁止第三人先入场、交叉淡化重叠三人、瞬移或偷偷删除角色/台词。
 - Talk 的说话者和 actions 的目标都必须在场；旁白可用 modelId=-1，但不能给 -1 安排动作。
 
 ## 开场序列
 
 ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个角色一条 LayoutAppear
 
-LayoutAppear 与 LayoutClear 都只做**原地淡入/淡出**：from 和 to 完全相同（同一 side、offset:0），moveSpeed="Normal"，wait:true。入场姿态按语境选自然动作/表情，平静站姿也可，不强迫夸张肢体。不要写画外 offset 或滑动换人。
+**入场/退场是独立的动画系统（滑入滑出+动作表演），与黑屏淡入淡出并存；角色永远不原地闪现**：
+- LayoutAppear 滑入：from 为同侧画外（Left:-100 / Right:+100；单人 Center 槽则 from 写 {"side":"Right","offset":100}），to 为槽位（offset:0），moveSpeed="Normal"，wait:true。角色滑入、入场动作播完后对话才开始。
+- 入场动作必须有肢体表现（招手、小跑、开心、点头、犹豫等，按角色性格与场景情绪选），**禁止 default 站姿类动作滑入**——站姿滑入等于站桩；表情按入场情绪选。
+- LayoutClear 滑出：from 为角色当前槽位（offset:0），to 为同侧画外（Left:-100 / Right:+100 / Center:+100），moveSpeed="Normal"，wait:true；motion/facial 填退场动作与表情（挥手、鞠躬、转身离开、跑出等），同样禁止 default 站姿退场。
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 6 项，每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：听者稍后点头/疑惑/缓和，每条至多 1 次反应。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **自然、克制、少而慢**：动作是点缀，不是逐句表演。一条台词内最多 1~2 次变化，同一姿态至少保持约 2 秒（相邻 at 间隔 ≥0.25）；短句、平静语气、过渡句一律不安排。表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 2 项，每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：说话者至多 1 次、听者至多 1 次。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **自然、克制、少而慢**：动作是点缀，不是逐句表演。**一条台词默认不安排 actions**，只有关键情绪转折才写；**整场带 actions 的台词不超过三分之一**，连续几条安静对话完全正常。短句、平静语气、过渡句一律不安排。相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
 - 动作/表情须来自对应 modelId 的完整名称，清单的前缀 * 只是分组，不是资源名；仅用明确列出的完整样例或默认值，不猜编号。
@@ -467,14 +470,14 @@ LayoutAppear 与 LayoutClear 都只做**原地淡入/淡出**：from 和 to 完�
 
 ## 成片时长
 
-这是一场约 3 分钟的短戏（含开场淡入、对话、退场），不是长篇。口语节奏下整场大约三分钟说完就收：尽快入戏，说完一个完整小事件或一个情绪转折立刻退场。宁可略短，也不要写成能演很久的连续剧。禁止大段铺垫、多场景跳转、多人轮番独白、重复确认同一句意思。话量仍跟人设走，但整场体量必须按三分钟短戏来写。
+这是一场约 3 分钟的短戏（含开场滑入、对话、退场），不是长篇。口语节奏下整场大约三分钟说完就收：尽快入戏，说完一个完整小事件或一个情绪转折立刻退场。宁可略短，也不要写成能演很久的连续剧。禁止大段铺垫、多场景跳转、多人轮番独白、重复确认同一句意思。话量仍跟人设走，但整场体量必须按三分钟短戏来写。
 
 ## 退场序列
 
 剧情结束时在场角色必须依次带动画退场，禁止无动画消失或站到黑屏：
 
 1. HideTalk（wait:true, delay 0.2）
-2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from/to 都等于角色当前槽位（offset:0），moveSpeed="Normal"，原地淡出；不要清除已离场角色
+2. 每个在场角色一条 LayoutClear（wait:true, delay 0.1）：from 为角色当前槽位（offset:0），to 为同侧画外（Left:-100 / Right:+100 / Center:+100），moveSpeed="Normal"，motion/facial 填退场动作与表情（禁止 default 站姿退场）；不要清除已离场角色
 3. BlackOut（duration 500~800）收尾。不使用 Telop。
 
 ## 结构示例（目录中的真实 ID/资源；只参考字段，不机械照抄表演）
@@ -496,7 +499,7 @@ LayoutAppear 与 LayoutClear 都只做**原地淡入/淡出**：from 和 to 完�
 
 ## 输出要求
 1. 只输出合法 JSON，无 markdown、无解释；仅含 models、images、snippets
-2. 开场与退场序列完整；LayoutAppear/LayoutClear 原地淡入淡出，from/to 相同、wait:true、moveSpeed="Normal"；任意时刻最多两人在场
+2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
 5. 每条 Talk 含 content、ttsText；有需要才写 actions，包含说话者及在场听者的时序变化；动作/表情必须来自各自角色清单
@@ -532,9 +535,9 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 6 项，每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
-- **少而慢**：一条台词最多 1~2 次变化，同一姿态至少保持约 2 秒（相邻 at 间隔 ≥0.25）；短句和平静语气不安排，不是每条都要动。不机关枪式换动作、不机械重复；保留自然停顿与倾听。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 2 项，每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。**一条台词默认不安排 actions**，只有关键情绪转折才写，**整场带 actions 的台词不超过三分之一**；相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- 表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；保留自然停顿与安静倾听，不机关枪式换动作、不机械重复。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
 - 可用动作：{motion_list}
@@ -555,21 +558,23 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 4. 每条 Talk **最多 3 行**（最多 2 个 \n）——这只是排版规则，**不是话量限制**：话多的角色照样多说，把话**拆成同角色的连续多条 Talk**（delay 取 0.15~0.2）即可；禁止为了塞进一条而删减、缩短台词，也禁止写出超过 3 行的单条 Talk
 5. ttsText 的换行位置与 content 保持一致
 
-开场淡入 + 对话表演 + 结尾淡出：
+开场滑入 + 对话表演 + 结尾滑出退场：
 ```
-ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear -> Talk(actions)... -> HideTalk -> LayoutClear -> BlackOut
+ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear(滑入+入场动作) -> Talk(actions)... -> HideTalk -> LayoutClear(滑出+退场动作) -> BlackOut
 ```
 
 **舞台与替换规则**：
 - ChangeLayoutMode.data.mode 只写 "Normal"。单人用 Center，两人用 Left / Right，不能同侧，也不能 Center 与另一槽混用。
 - 始终维护在场名单：models 是整场演员表，不是在场名单。任意时刻最多两人；只有 LayoutAppear 完成才在场，LayoutClear 完成才释放槽位。背景/黑屏不会清除角色。
-- LayoutAppear/LayoutClear 均为原地淡入/淡出：from 和 to 完全相同（同侧、offset:0）、moveSpeed="Normal"、wait:true，不用滑动/画外位置。自然站姿亦可，不强迫夸张动作。
-- 换人必须 HideTalk → 旧角色 LayoutClear(wait:true) 完全淡出 → 新角色在已释放槽位 LayoutAppear(wait:true) 淡入；禁止第三人先出现或两次渐变重叠成三人在场。
+- **入场/退场是独立的动画系统（滑入滑出+动作表演），与黑屏淡入淡出并存；角色永远不原地闪现**：
+  - LayoutAppear 滑入：from 为同侧画外（Left:-100 / Right:+100；单人 Center 槽则 from 写 {"side":"Right","offset":100}），to 为槽位（offset:0），moveSpeed="Normal"、wait:true。入场动作选有明显肢体表现的（招手、开心、点头、犹豫等），**禁止 default 站姿滑入**。
+  - LayoutClear 滑出：from 为角色当前槽位（offset:0），to 为同侧画外（Left:-100 / Right:+100 / Center:+100），moveSpeed="Normal"，motion/facial 填退场动作与表情（挥手、鞠躬、转身离开等），禁止 default 站姿退场。
+- 换人必须 HideTalk → 旧角色 LayoutClear(wait:true) 完全滑出 → 新角色从画外滑入已释放槽位 LayoutAppear(wait:true)；禁止第三人先出现或两次渐变重叠成三人在场。
 - Talk 和 actions 只指向已入场角色；旁白可用 modelId=-1，但不能给 -1 配动作。
 
 **结尾退场序列（缺一不可）：**
 1. HideTalk（wait:true, delay:0.2）
-2. 每个仍在场角色 LayoutClear（wait:true, delay:0.1），from/to 均为当前位置，moveSpeed="Normal"
+2. 每个仍在场角色 LayoutClear（wait:true, delay:0.1）：from 为当前槽位（offset:0），to 为同侧画外（Center:+100 / Left:-100 / Right:+100），moveSpeed="Normal"，motion/facial 填退场动作表情
 3. BlackOut（wait:true, duration:600）。不使用 Telop。
 
 ### 结构示例（目录真实资源；单人时省去听者动作，勿机械照抄）
@@ -579,7 +584,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 ## 输出要求
 1. 只输出合法 JSON，无额外文字；仅含 models、images、snippets
-2. 开场与退场序列完整；LayoutAppear/LayoutClear 原地淡入淡出，from/to 相同、wait:true、moveSpeed="Normal"；任意时刻最多两人在场
+2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
 3. speaker 与 modelId 必须来自对照表；actions 可选，按语义安排说话者和在场听者的变化，不要求每句重复动作
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
@@ -1190,29 +1195,35 @@ class MySekaiStorytellerPlugin(Star):
             {"id": m.get("id"), "model": m.get("path"), "normal_scale": 2.1,
              "small_scale": 1.8, "anchor": 0.5} for m in models
         ]
+
+        def stage_motion(model_id):
+            m = view.model_by_id(model_id) or view.default_model()
+            names = m.get("motions") or []
+            return next((n for n in names if "default" not in n.lower() and "stand" not in n.lower()),
+                        view.default_motion(model_id))
+
         def action(model_id, at, field):
             m = view.model_by_id(model_id) or view.default_model()
             values = m.get("motions" if field == "motion" else "facials") or []
             fallback = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
             return {"at": at, "modelId": model_id, field: values[0] if values else fallback}
         if len(ids) == 1:
-            side = "Center"
             talk_actions = [action(ids[0], 0.35, "motion")]
             appears = [{"type": "LayoutAppear", "wait": True, "delay": 0,
-                        "data": {"modelId": ids[0], "from": {"side": side, "offset": 0},
-                                 "to": {"side": side, "offset": 0},
-                                 "motion": view.default_motion(ids[0]), "facial": view.default_facial(ids[0]),
+                        "data": {"modelId": ids[0], "from": {"side": "Right", "offset": 100},
+                                 "to": {"side": "Center", "offset": 0},
+                                 "motion": stage_motion(ids[0]), "facial": view.default_facial(ids[0]),
                                  "facialFirst": True, "moveSpeed": "Normal"}}]
         else:
             first, second = ids
             appears = []
-            for model_id, side in ((first, "Left"), (second, "Right")):
+            for model_id, side, enter_offset in ((first, "Left", -100), (second, "Right", 100)):
                 appears.append({"type": "LayoutAppear", "wait": True, "delay": 0,
-                                "data": {"modelId": model_id, "from": {"side": side, "offset": 0},
+                                "data": {"modelId": model_id, "from": {"side": side, "offset": enter_offset},
                                          "to": {"side": side, "offset": 0},
-                                         "motion": view.default_motion(model_id), "facial": view.default_facial(model_id),
+                                         "motion": stage_motion(model_id), "facial": view.default_facial(model_id),
                                          "facialFirst": True, "moveSpeed": "Normal"}})
-            talk_actions = [action(first, 0.25, "motion"), action(second, 0.65, "facial")]
+            talk_actions = [action(first, 0.3, "motion")]
         snippets = [{"type": "ChangeLayoutMode", "wait": False, "delay": 0, "data": {"mode": "Normal"}},
                     *appears,
                     {"type": "Talk", "wait": False, "delay": 0,
@@ -1220,9 +1231,11 @@ class MySekaiStorytellerPlugin(Star):
                               "modelId": ids[0], "actions": talk_actions}},
                     {"type": "HideTalk", "wait": True, "delay": 0.2},
                     *[{"type": "LayoutClear", "wait": True, "delay": 0.1,
-                       "data": {"modelId": m.get("id"), "from": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"), "offset": 0},
-                                "to": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"), "offset": 0},
-                                "motion": view.default_motion(m.get("id")), "facial": view.default_facial(m.get("id")), "moveSpeed": "Normal"}}
+                       "data": {"modelId": m.get("id"),
+                                "from": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"), "offset": 0},
+                                "to": {"side": "Center" if len(ids) == 1 else ("Left" if i == 0 else "Right"),
+                                       "offset": 100 if (len(ids) == 1 or i == 1) else -100},
+                                "motion": stage_motion(m.get("id")), "facial": view.default_facial(m.get("id")), "moveSpeed": "Normal"}}
                       for i, m in enumerate(models)],
                     {"type": "BlackOut", "wait": True, "delay": 0, "data": {"duration": 600}}]
         return json.dumps({"models": entries, "images": [{"id": 1, "image": view.default_image()}],
@@ -1407,11 +1420,31 @@ class MySekaiStorytellerPlugin(Star):
             return view.valid_motions(model_id) or {view.default_motion(model_id)}
         return view.valid_facials(model_id) or {view.default_facial(model_id)}
 
+    @staticmethod
+    def _offscreen_position(side: str) -> dict:
+        """同侧画外起点/终点：Left 走左侧画外、Right 走右侧画外、Center 从右侧画外斜向进出。"""
+        return ({"side": "Right", "offset": 100} if side == "Center"
+                else {"side": side, "offset": -100 if side == "Left" else 100})
+
+    @staticmethod
+    def _is_standing_motion(name: str) -> bool:
+        lowered = (name or "").lower()
+        return "default" in lowered or "stand" in lowered
+
+    def _pick_stage_motion(self, view, model_id: int) -> str:
+        """入场/退场兜底动作：跳过 default 站姿类，取清单里第一个有肢体表现的动作。"""
+        model = view.model_by_id(model_id) or view.default_model()
+        for name in model.get("motions") or []:
+            if not self._is_standing_motion(name):
+                return name
+        return view.default_motion(model_id)
+
     def _validate_actions(self, data: dict, view, model_ids: set, label: str) -> None:
         if "actions" not in data:
             return
         actions = data["actions"]
-        # 生成剧本走克制的表演节奏：少量、慢速的状态变化比频繁切换自然。
+        # 生成剧本走克制的表演节奏：一条台词至多 2 处变化（说话者/听者各 1），
+        # 变化之间至少隔 0.3；超出的部分直接裁掉，不触发整场重试。
         # 渲染层仍允许手工剧本最多 24 项，这里只约束插件产出。
         if not isinstance(actions, list) or len(actions) > 6:
             raise ValueError(f"{label}.actions 必须是最多 6 项的数组（动作是点缀，不要频繁切换）")
@@ -1437,7 +1470,17 @@ class MySekaiStorytellerPlugin(Star):
             if len(cleaned) == 2:
                 raise ValueError(f"{where} 至少需要一个 motion 或 facial")
             normalized.append(cleaned)
-        data["actions"] = sorted(normalized, key=lambda action: action["at"])
+        normalized.sort(key=lambda action: action["at"])
+        spaced: list[dict] = []
+        for action in normalized:
+            if len(spaced) >= 2:
+                logger.info(f"{label}.actions 超过 2 项，已裁掉多余变化（{action.get('motion') or action.get('facial')}）")
+                continue
+            if spaced and action["at"] - spaced[-1]["at"] < 0.3:
+                logger.info(f"{label}.actions 相邻变化间隔过近（<0.3），已裁掉 {action.get('motion') or action.get('facial')}")
+                continue
+            spaced.append(action)
+        data["actions"] = spaced
 
     def _normalize_scene(self, story_data: dict) -> None:
         """插件的舞台约束；非法换人交给原有 LLM 重试，不删台词、不代选退场者。"""
@@ -1458,12 +1501,14 @@ class MySekaiStorytellerPlugin(Star):
                 if model_id in visible:
                     raise ValueError(f"{label} 角色已在场，不能重复入场")
                 if len(visible) >= 2 or (mode == "One" and visible):
-                    raise ValueError(f"{label} 同时最多两人在场；先 LayoutClear(wait:true) 完全淡出旧角色再入场")
-                position = {"side": data["to"]["side"], "offset": 0}
+                    raise ValueError(f"{label} 同时最多两人在场；先 LayoutClear(wait:true) 完全滑出旧角色再入场")
+                side = data["to"]["side"] if data["to"]["side"] in self.VALID_SIDES else "Left"
+                position = {"side": side, "offset": 0}
                 if any(p["side"] == position["side"] or "Center" in (p["side"], position["side"]) for p in visible.values()):
                     raise ValueError(f"{label} 双人必须占用不同的 Left/Right 槽位")
-                data["from"], data["to"] = dict(position), dict(position)
-                data["moveSpeed"], snippet["wait"] = "Normal", True
+                # 槽位固定在画面内 offset:0；起点强制改写为同侧画外 → 滑入（入场动画系统）
+                data["to"] = dict(position)
+                data["from"] = self._offscreen_position(side)
                 visible[model_id] = position
             elif kind in {"LayoutClear", "Move"}:
                 if model_id not in visible:
@@ -1471,8 +1516,9 @@ class MySekaiStorytellerPlugin(Star):
                 data["from"] = dict(visible[model_id])
                 snippet["wait"] = True
                 if kind == "LayoutClear":
-                    data["to"] = dict(visible.pop(model_id))
-                    data["moveSpeed"] = "Normal"
+                    # 退场 = 滑出到同侧画外（退场动画系统），槽位随之释放
+                    data["to"] = self._offscreen_position(visible[model_id]["side"])
+                    visible.pop(model_id)
                 else:
                     position = data["to"]
                     if any(other != model_id and (p["side"] == position["side"] or "Center" in (p["side"], position["side"])) for other, p in visible.items()):
@@ -1675,11 +1721,15 @@ class MySekaiStorytellerPlugin(Star):
                 data = snippet.get("data", {})
                 data["modelId"] = self._to_number(data.get("modelId"), 1)
                 model_id = data["modelId"]
-                data["motion"] = self._to_str(data.get("motion"), view.default_motion(model_id))
+                data["motion"] = self._to_str(data.get("motion"), "")
                 data["facial"] = self._to_str(data.get("facial"), view.default_facial(model_id))
                 for field in ("motion", "facial"):
-                    if data[field] not in self._animation_choices(view, model_id, field):
-                        data[field] = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
+                    if data[field] and data[field] not in self._animation_choices(view, model_id, field):
+                        logger.warning(f"LayoutAppear {field} '{data[field]}' not available for {view.name_by_id(model_id)}, falling back")
+                        data[field] = "" if field == "motion" else view.default_facial(model_id)
+                # 入场必须有动作，且禁止 default 站姿滑入（站姿滑入等于站桩）
+                if not data["motion"] or self._is_standing_motion(data["motion"]):
+                    data["motion"] = self._pick_stage_motion(view, model_id)
                 data["facialFirst"] = self._to_bool(data.get("facialFirst"), True)
                 data["moveSpeed"] = self._to_str(data.get("moveSpeed"), "Normal")
                 if data["moveSpeed"] not in self.VALID_MOVE_SPEEDS:
@@ -1690,9 +1740,9 @@ class MySekaiStorytellerPlugin(Star):
                 data["to"]["side"] = self._to_str(data["to"].get("side"), "Left")
                 if data["to"]["side"] not in self.VALID_SIDES:
                     data["to"]["side"] = "Left"
-                data["to"]["offset"] = self._to_number(data["to"].get("offset"), 0)
-                # 舞台阶段统一为原地淡入，不保留旧的滑入起点。
-                data["from"] = dict(data["to"])
+                # 槽位永远在画面内 offset:0；起点写同侧画外 → 滑入（_normalize_scene 按槽位追踪覆盖）
+                data["to"]["offset"] = 0
+                data["from"] = self._offscreen_position(data["to"]["side"])
                 snippet["data"] = data
 
             elif snippet_type == "LayoutClear":
@@ -1708,15 +1758,15 @@ class MySekaiStorytellerPlugin(Star):
                 if data["from"]["side"] not in self.VALID_SIDES:
                     data["from"]["side"] = "Center"
                 data["from"]["offset"] = self._to_number(data["from"].get("offset"), 0)
-                # 退场也原地淡出；_normalize_scene 会覆盖为当前追踪槽位。
-                data["to"] = dict(data["from"])
-                # 退场动作/表情：非法值回退该角色默认（退场必须有动作，禁止无动画消失）
+                # 退场 = 滑出到同侧画外；from/to 由 _normalize_scene 按当前追踪槽位覆盖。
+                data["to"] = self._offscreen_position(data["from"]["side"])
+                # 退场必须有动作（禁止无动画消失），且禁止 default 站姿退场
                 clear_motion = self._clean_path(self._to_str(data.get("motion"), ""))
-                if not clear_motion:
-                    clear_motion = view.default_motion(model_id)
-                elif clear_motion not in view.valid_motions(model_id):
-                    logger.warning(f"LayoutClear motion '{clear_motion}' not available for {view.name_by_id(model_id)}, falling back to {view.default_motion(model_id)}")
-                    clear_motion = view.default_motion(model_id)
+                if clear_motion and clear_motion not in view.valid_motions(model_id):
+                    logger.warning(f"LayoutClear motion '{clear_motion}' not available for {view.name_by_id(model_id)}, falling back")
+                    clear_motion = ""
+                if not clear_motion or self._is_standing_motion(clear_motion):
+                    clear_motion = self._pick_stage_motion(view, model_id)
                 data["motion"] = clear_motion
                 clear_facial = self._clean_path(self._to_str(data.get("facial"), ""))
                 if not clear_facial:
