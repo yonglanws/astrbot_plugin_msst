@@ -26,6 +26,12 @@
     "hint": "同时进行的视频导出任务数上限。需与渲染宿主 render.workers 对齐，默认 2。",
     "default": 2
   },
+  "script_max_concurrent": {
+    "description": "最大并发剧本生成数",
+    "type": "int",
+    "hint": "剧本生成（LLM）与视频导出分开限流：剧本并行生成，导出按最大并发导出数串行渲染；剧本不占用导出队列位置。默认 2。",
+    "default": 2
+  },
   "temp_dir": {
     "description": "临时文件存储目录",
     "type": "string",

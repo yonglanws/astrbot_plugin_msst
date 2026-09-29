@@ -615,6 +615,7 @@ class MySekaiStorytellerPlugin(Star):
         self.mss_api_url = config.get("mss_api_url", "http://127.0.0.1:9881")
         self.export_timeout = config.get("export_timeout", 600)
         self.max_concurrent_exports = config.get("max_concurrent_exports", 2)
+        self.script_max_concurrent = config.get("script_max_concurrent", 2)
         self.temp_dir = config.get("temp_dir", "")
         self.callback_api_base = config.get("callback_api_base", "").rstrip("/")
 
@@ -690,6 +691,11 @@ class MySekaiStorytellerPlugin(Star):
             default_max_retries=2,
             cleanup_interval=300
         )
+
+        # 剧本生成与视频导出分开限流：剧本（LLM，网络型）并行，导出（GPU）串行，
+        # 剧本生成不占导出队列位置——串行配置下第二个剧本也能在第一个视频
+        # 渲染期间生成完毕，导出队列不再被 LLM 等待时间顶住
+        self._script_semaphore = asyncio.Semaphore(self.script_max_concurrent)
 
         self._session_timeout_seconds = 3600  # 30分钟超时
 
@@ -1871,35 +1877,10 @@ class MySekaiStorytellerPlugin(Star):
 
         await self._ensure_queue_processor_started()
 
-        try:
-            task_id = await self.export_queue.add_task(
-                user_id=user_id,
-                coroutine_func=self._queued_chat_export,
-                priority=1,
-                kwargs={
-                    "message": message,
-                    "user_id": user_id,
-                    "event_context": self._extract_event_context(event)
-                }
-            )
-        except QueueFullError as e:
-            yield event.plain_result("当前排队已满，请稍后再试")
-            return
-
-        # 立即显示排队状态
-        queue_status = await self.export_queue.get_task_status(task_id)
+        # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
-            position = queue_status["position"]
-            est_min, est_max = self._calculate_wait_time(position, "chat")
-            yield event.plain_result(self._format_queue_message(position, est_min, est_max))
-        else:
-            yield event.plain_result(
-                f"视频生成中...\n"
-                f"预计等待：1-3分钟"
-            )
-
-        asyncio.create_task(self._monitor_and_send_video(task_id, event, event_context))
+        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
+        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context))
 
     @filter.command("剧本生成", alias={'剧本对话', '故事生成', 'story', '生成剧本', '生成故事'})
     async def mss_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -1922,49 +1903,10 @@ class MySekaiStorytellerPlugin(Star):
         user_id = str(event.get_sender_id())
         await self._ensure_queue_processor_started()
 
-        try:
-            # 立即加入队列
-            task_id = await self.export_queue.add_task(
-                user_id=user_id,
-                coroutine_func=self._queued_story_export,
-                priority=2,
-                kwargs={
-                    "scene": scene,
-                    "sender_id": user_id,
-                    "event_context": self._extract_event_context(event)
-                }
-            )
-        except QueueFullError as e:
-            queue_stats = await self.export_queue.get_queue_stats()
-            pending = queue_stats.get('pending_count', 0)
-            running = queue_stats.get('running_count', 0) or queue_stats.get('rendering_count', 0)
-
-            yield event.plain_result(
-                f"🚫 队列已满，暂时无法添加新任务\n\n"
-                f"📊 当前队列状态:\n"
-                f"⏳ 排队中: {pending} 个\n"
-                f"🔄 运行中: {running} 个\n\n"
-                f"💡 建议:\n"
-                f"1. 等待 {max(1, pending * 30 // 60)} 分钟后再试\n"
-                f"2. 使用 /mssadmin queue 查看详细队列状态\n"
-                f"3. 联系管理员增加队列容量"
-            )
-            return
-
-        # 立即显示排队信息
-        queue_status = await self.export_queue.get_task_status(task_id)
+        # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
-            position = queue_status["position"]
-            est_min, est_max = self._calculate_wait_time(position, "story")
-            yield event.plain_result(self._format_queue_message(position, est_min, est_max))
-        else:
-            yield event.plain_result(
-                f"视频生成中...\n"
-                f"预计等待：1-3分钟"
-            )
-
-        asyncio.create_task(self._monitor_and_send_video(task_id, event, event_context))
+        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
+        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context))
 
     @filter.command("测试视频对话", alias={'测试视频生成', '测试视频聊天'})
     async def mss_test_chat_mode(self, event: AstrMessageEvent, message: str):
@@ -1982,34 +1924,10 @@ class MySekaiStorytellerPlugin(Star):
 
         await self._ensure_queue_processor_started()
 
-        try:
-            task_id = await self.export_queue.add_task(
-                user_id=user_id,
-                coroutine_func=self._queued_chat_export,
-                priority=1,
-                kwargs={
-                    "message": message,
-                    "user_id": user_id,
-                    "event_context": self._extract_event_context(event)
-                }
-            )
-        except QueueFullError as e:
-            yield event.plain_result("当前排队已满，请稍后再试")
-            return
-
-        queue_status = await self.export_queue.get_task_status(task_id)
+        # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
-            position = queue_status["position"]
-            est_min, est_max = self._calculate_wait_time(position, "chat")
-            yield event.plain_result(self._format_queue_message(position, est_min, est_max))
-        else:
-            yield event.plain_result(
-                f"视频生成中...\n"
-                f"预计等待：1-3分钟"
-            )
-
-        asyncio.create_task(self._monitor_and_send_video(task_id, event, event_context))
+        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
+        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context))
 
     @filter.command("测试剧本生成", alias={'测试故事生成', '测试story', '测试生成剧本'})
     async def mss_test_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2027,34 +1945,10 @@ class MySekaiStorytellerPlugin(Star):
 
         await self._ensure_queue_processor_started()
 
-        try:
-            task_id = await self.export_queue.add_task(
-                user_id=user_id,
-                coroutine_func=self._queued_story_export,
-                priority=2,
-                kwargs={
-                    "scene": scene,
-                    "sender_id": user_id,
-                    "event_context": self._extract_event_context(event)
-                }
-            )
-        except QueueFullError as e:
-            yield event.plain_result("当前排队已满，请稍后再试")
-            return
-
-        queue_status = await self.export_queue.get_task_status(task_id)
+        # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
-            position = queue_status["position"]
-            est_min, est_max = self._calculate_wait_time(position, "story")
-            yield event.plain_result(self._format_queue_message(position, est_min, est_max))
-        else:
-            yield event.plain_result(
-                f"视频生成中...\n"
-                f"预计等待：1-3分钟"
-            )
-
-        asyncio.create_task(self._monitor_and_send_video(task_id, event, event_context))
+        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
+        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context))
 
     def _extract_event_context(self, event: AstrMessageEvent) -> dict:
         """提取事件上下文信息，用于后续消息发送"""
@@ -2281,107 +2175,141 @@ class MySekaiStorytellerPlugin(Star):
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
 
-    async def _queued_chat_export(self, message: str, user_id: str = "", event_context: dict = None) -> dict:
-        """对话模式队列任务：先生成剧本，再导出视频"""
-        try:
-            # LLM 生成剧本
-            system_prompt, user_prompt = await self._build_chat_prompt(message, user_id)
-            max_retries = 2
-            story_data = None
+    async def _generate_chat_story(self, message: str, user_id: str) -> tuple:
+        """LLM 生成对话剧本（含校验重试），返回 (story_data, 首个说话角色)。
+        只做剧本阶段，不涉及视频导出——由调用方决定何时入导出队列。"""
+        system_prompt, user_prompt = await self._build_chat_prompt(message, user_id)
+        max_retries = 2
+        story_data = None
 
-            for attempt in range(max_retries + 1):
-                llm_response = await self._call_llm_structured(user_prompt, system_prompt)
-                if not llm_response:
-                    continue
+        for attempt in range(max_retries + 1):
+            llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            if not llm_response:
+                continue
 
-                story_data = self._extract_json_from_response(llm_response)
-                if not story_data:
-                    if attempt < max_retries:
-                        logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
-                        continue
-                    raise ValueError("AI 返回的内容无法解析为 JSON")
-
-                try:
-                    story_data = self._validate_and_fix_story(story_data)
-                    break
-                except ValueError as e:
-                    if attempt < max_retries:
-                        logger.warning(f"验证失败，重试 ({attempt+1}/{max_retries}): {e}")
-                        user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
-                        continue
-                    raise e
-
+            story_data = self._extract_json_from_response(llm_response)
             if not story_data:
+                if attempt < max_retries:
+                    logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
+                    continue
                 raise ValueError("AI 返回的内容无法解析为 JSON")
 
-            story_data = await self._ensure_tts_text(story_data)
+            try:
+                story_data = self._validate_and_fix_story(story_data)
+                break
+            except ValueError as e:
+                if attempt < max_retries:
+                    logger.warning(f"验证失败，重试 ({attempt+1}/{max_retries}): {e}")
+                    user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
+                    continue
+                raise e
 
-            # 添加聊天历史（role 记录本次实际说话的角色）
-            first_content = ""
-            first_speaker = ""
-            for s in story_data.get("snippets", []):
-                if s.get("type") == "Talk":
-                    first_content = s.get("data", {}).get("content", "")
-                    first_speaker = s.get("data", {}).get("speaker", "")
-                    break
-            await self._add_chat_history(user_id, message, first_content, first_speaker)
+        if not story_data:
+            raise ValueError("AI 返回的内容无法解析为 JSON")
 
-            # 调用导出函数
-            return await self._queued_export_and_send(
+        story_data = await self._ensure_tts_text(story_data)
+
+        # 添加聊天历史（role 记录本次实际说话的角色）
+        first_content = ""
+        first_speaker = ""
+        for s in story_data.get("snippets", []):
+            if s.get("type") == "Talk":
+                first_content = s.get("data", {}).get("content", "")
+                first_speaker = s.get("data", {}).get("speaker", "")
+                break
+        await self._add_chat_history(user_id, message, first_content, first_speaker)
+        return story_data, first_speaker
+
+    async def _generate_story(self, scene: str) -> dict:
+        """LLM 生成剧本（含校验重试），只做剧本阶段。"""
+        system_prompt, user_prompt = await self._build_prompt(scene)
+        max_retries = 2
+        story_data = None
+
+        for attempt in range(max_retries + 1):
+            llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            if not llm_response:
+                continue
+
+            story_data = self._extract_json_from_response(llm_response)
+            if not story_data:
+                if attempt < max_retries:
+                    logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
+                    continue
+                raise ValueError("AI 返回的内容无法解析为 JSON")
+
+            try:
+                story_data = self._validate_and_fix_story(story_data)
+                break
+            except ValueError as e:
+                if attempt < max_retries:
+                    logger.warning(f"验证失败，AI自动修正重试 ({attempt+1}/{max_retries}): {e}")
+                    user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
+                    continue
+                raise e
+
+        if not story_data:
+            raise ValueError("AI 返回的内容无法解析为 JSON")
+
+        return await self._ensure_tts_text(story_data)
+
+    async def _enqueue_export_and_monitor(self, event, event_context: dict, user_id: str,
+                                          story_data: dict, description: str,
+                                          priority: int, wait_kind: str):
+        """剧本完成后入导出队列并监控发送。剧本阶段已结束，这里只处理导出。"""
+        try:
+            task_id = await self.export_queue.add_task(
+                user_id=user_id,
+                coroutine_func=self._queued_export_and_send,
+                priority=priority,
+                kwargs={
+                    "story_data": story_data,
+                    "sender_id": user_id,
+                    "description": description,
+                    "event_context": event_context
+                }
+            )
+        except QueueFullError:
+            await self._send_safe_message(event, "剧本已生成，但渲染队列已满，请稍后再试", event_context)
+            return
+
+        queue_status = await self.export_queue.get_task_status(task_id)
+        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
+            position = queue_status["position"]
+            est_min, est_max = self._calculate_wait_time(position, wait_kind)
+            await self._send_safe_message(event, self._format_queue_message(position, est_min, est_max), event_context)
+
+        await self._monitor_and_send_video(task_id, event, event_context)
+
+    async def _pipeline_chat(self, event, message: str, user_id: str, event_context: dict = None):
+        """对话模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
+        try:
+            async with self._script_semaphore:
+                story_data, first_speaker = await self._generate_chat_story(message, user_id)
+            await self._enqueue_export_and_monitor(
+                event, event_context, user_id=user_id,
                 story_data=story_data,
-                sender_id=user_id,
                 description=f"{first_speaker}的回复" if first_speaker else "角色回复",
-                event_context=event_context
+                priority=1, wait_kind="chat"
             )
         except Exception as e:
-            logger.error(f"对话生成+导出失败: {e}")
-            raise
+            logger.error(f"对话剧本生成失败: {e}")
+            await self._send_safe_message(event, self._user_error(e), event_context)
 
-    async def _queued_story_export(self, scene: str, sender_id: str = "", event_context: dict = None) -> dict:
-        """剧本模式队列任务：先生成剧本，再导出视频"""
+    async def _pipeline_story(self, event, scene: str, sender_id: str, event_context: dict = None):
+        """剧本模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
         try:
-            # LLM 生成剧本
-            system_prompt, user_prompt = await self._build_prompt(scene)
-            max_retries = 2
-            story_data = None
-
-            for attempt in range(max_retries + 1):
-                llm_response = await self._call_llm_structured(user_prompt, system_prompt)
-                if not llm_response:
-                    continue
-
-                story_data = self._extract_json_from_response(llm_response)
-                if not story_data:
-                    if attempt < max_retries:
-                        logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
-                        continue
-                    raise ValueError("AI 返回的内容无法解析为 JSON")
-
-                try:
-                    story_data = self._validate_and_fix_story(story_data)
-                    break
-                except ValueError as e:
-                    if attempt < max_retries:
-                        logger.warning(f"验证失败，AI自动修正重试 ({attempt+1}/{max_retries}): {e}")
-                        user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
-                        continue
-                    raise e
-
-            if not story_data:
-                raise ValueError("AI 返回的内容无法解析为 JSON")
-
-            story_data = await self._ensure_tts_text(story_data)
-
-            # 调用导出函数
-            return await self._queued_export_and_send(
+            async with self._script_semaphore:
+                story_data = await self._generate_story(scene)
+            await self._enqueue_export_and_monitor(
+                event, event_context, user_id=sender_id,
                 story_data=story_data,
-                sender_id=sender_id,
                 description=scene,
-                event_context=event_context
+                priority=2, wait_kind="story"
             )
         except Exception as e:
-            logger.error(f"剧本生成+导出失败: {e}")
-            raise
+            logger.error(f"剧本生成失败: {e}")
+            await self._send_safe_message(event, self._user_error(e), event_context)
 
     async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频", event_context: dict = None) -> dict:
         """队列任务调用的视频导出方法"""
