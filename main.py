@@ -2042,8 +2042,9 @@ class MySekaiStorytellerPlugin(Star):
 
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
-        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context))
+        backlog = await self._queue_backlog()
+        yield event.plain_result(self._initial_reply(backlog, "chat"))
+        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context, backlog))
 
     @filter.command("剧本生成", alias={'剧本对话', '故事生成', 'story', '生成剧本', '生成故事'})
     async def mss_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2068,8 +2069,9 @@ class MySekaiStorytellerPlugin(Star):
 
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
-        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context))
+        backlog = await self._queue_backlog()
+        yield event.plain_result(self._initial_reply(backlog, "story"))
+        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context, backlog))
 
     @filter.command("测试视频对话", alias={'测试视频生成', '测试视频聊天'})
     async def mss_test_chat_mode(self, event: AstrMessageEvent, message: str):
@@ -2089,8 +2091,9 @@ class MySekaiStorytellerPlugin(Star):
 
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
-        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context))
+        backlog = await self._queue_backlog()
+        yield event.plain_result(self._initial_reply(backlog, "chat"))
+        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context, backlog))
 
     @filter.command("测试剧本生成", alias={'测试故事生成', '测试story', '测试生成剧本'})
     async def mss_test_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2110,8 +2113,9 @@ class MySekaiStorytellerPlugin(Star):
 
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        yield event.plain_result("正在生成剧本...（完成后自动渲染视频）")
-        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context))
+        backlog = await self._queue_backlog()
+        yield event.plain_result(self._initial_reply(backlog, "story"))
+        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context, backlog))
 
     def _extract_event_context(self, event: AstrMessageEvent) -> dict:
         """提取事件上下文信息，用于后续消息发送"""
@@ -2416,9 +2420,26 @@ class MySekaiStorytellerPlugin(Star):
 
         return await self._ensure_tts_text(story_data)
 
+    async def _queue_backlog(self) -> int:
+        """命令到达时导出队列的积压估算（等待中 + 正在渲染）。"""
+        try:
+            stats = await self.export_queue.get_queue_stats()
+            return (stats.get('pending_count', 0) or 0) + (stats.get('running_count', 0) or 0)
+        except Exception as e:
+            logger.warning(f"读取队列积压失败: {e}")
+            return 0
+
+    def _initial_reply(self, position: int, wait_kind: str) -> str:
+        """命令即时回复：与剧本生成前流水线一致的两段式文案。"""
+        if position > 0:
+            est_min, est_max = self._calculate_wait_time(position, wait_kind)
+            return self._format_queue_message(position, est_min, est_max)
+        return f"视频生成中...\n预计等待：1-3分钟"
+
     async def _enqueue_export_and_monitor(self, event, event_context: dict, user_id: str,
                                           story_data: dict, description: str,
-                                          priority: int, wait_kind: str):
+                                          priority: int, wait_kind: str,
+                                          reported_position: int = 0):
         """剧本完成后入导出队列并监控发送。剧本阶段已结束，这里只处理导出。"""
         try:
             task_id = await self.export_queue.add_task(
@@ -2437,14 +2458,15 @@ class MySekaiStorytellerPlugin(Star):
             return
 
         queue_status = await self.export_queue.get_task_status(task_id)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > 0:
+        if queue_status and queue_status.get("position") is not None and queue_status["position"] > reported_position:
             position = queue_status["position"]
             est_min, est_max = self._calculate_wait_time(position, wait_kind)
             await self._send_safe_message(event, self._format_queue_message(position, est_min, est_max), event_context)
 
         await self._monitor_and_send_video(task_id, event, event_context)
 
-    async def _pipeline_chat(self, event, message: str, user_id: str, event_context: dict = None):
+    async def _pipeline_chat(self, event, message: str, user_id: str, event_context: dict = None,
+                             reported_position: int = 0):
         """对话模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
         try:
             async with self._script_semaphore:
@@ -2453,13 +2475,14 @@ class MySekaiStorytellerPlugin(Star):
                 event, event_context, user_id=user_id,
                 story_data=story_data,
                 description=f"{first_speaker}的回复" if first_speaker else "角色回复",
-                priority=1, wait_kind="chat"
+                priority=1, wait_kind="chat", reported_position=reported_position
             )
         except Exception as e:
             logger.error(f"对话剧本生成失败: {e}")
             await self._send_safe_message(event, self._user_error(e), event_context)
 
-    async def _pipeline_story(self, event, scene: str, sender_id: str, event_context: dict = None):
+    async def _pipeline_story(self, event, scene: str, sender_id: str, event_context: dict = None,
+                              reported_position: int = 0):
         """剧本模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
         try:
             async with self._script_semaphore:
@@ -2468,7 +2491,7 @@ class MySekaiStorytellerPlugin(Star):
                 event, event_context, user_id=sender_id,
                 story_data=story_data,
                 description=scene,
-                priority=2, wait_kind="story"
+                priority=2, wait_kind="story", reported_position=reported_position
             )
         except Exception as e:
             logger.error(f"剧本生成失败: {e}")
