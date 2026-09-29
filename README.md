@@ -134,18 +134,6 @@ POST /api/v1/export → 渲染宿主渲染 Live2D 并导出 MP4
 回执：耗时 / 时长 / 大小；统计入库；临时文件定期清理
 ```
 
-## 测试（可选）
-
-提示词构建、人格绑定、队列并发与错误反馈测试无需 AstrBot 运行时：
-
-```bash
-# 离线模式（内置模拟目录，无需宿主）
-python scripts/test-prompt-build.py --offline
-
-# 对接真实渲染宿主
-python scripts/test-prompt-build.py [宿主地址，默认 http://127.0.0.1:9881]
-```
-
 ## 故障排除
 
 ### LLM 调用失败
@@ -179,7 +167,6 @@ astrbot_plugin_msst/
 ├── metadata.yaml        # 插件元数据
 ├── _conf_schema.json    # 配置模式定义
 ├── requirements.txt     # Python 依赖（httpx）
-├── scripts/             # test-prompt-build.py 提示词构建端到端测试
 └── README.md            # 本文档
 ```
 
