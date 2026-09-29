@@ -271,7 +271,7 @@ SNIPPET_SCHEMAS = {
                     "content": {"type": "string", "description": "对话内容，可用 \\n 换行"},
                     "modelId": {"type": "number", "default": -1},
                     "voice": {"type": "string", "default": ""},
-                    "motion": {"type": "string", "default": "", "description": "一般留空（姿态自然保持）；仅当台词开场就必须换姿态时才填，必须用该角色可用动作清单里的名字"},
+                    "motion": {"type": "string", "default": "", "description": "说话时的并发身体动作（边说边做），必须用该角色可用动作清单里的名字"},
                     "facial": {"type": "string", "default": "", "description": "说话时的并发表情，可选"},
                     "actions": ACTION_LIST_SCHEMA,
                 }
@@ -449,13 +449,12 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 3 项，每项至少 motion/facial 之一。
-- **只给说话的人安排动作，且尽可能少**：说话的人可以做动作，但一条台词通常 1 处就够、至多 2 处，相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。整场只有 2~4 条关键台词带 actions（不超过全部台词的四分之一），其余台词一律安静说完。**这些配额由系统硬性执行，超出的动作会被自动删除**。
-- **不说话的人尽量不做动作**：听者默认完全安静，只有剧情特别需要时才给**整场唯一的一次**反应（一条至多 1 个动作），超出的会被系统自动删除。听者只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **动作要极少、极准**：每个动作必须贴台词内容或情绪转折（说到某物时指一指、被戳中时惊讶、安心时松口气），禁止无意义的装饰性动作；没有贴合的动作、或觉得这段太杂，就干脆不写。短句、平静语气、过渡句一律不安排。
-- **旧 motion/facial 字段一般留空**：姿态会自然保持，只在台词开场就必须换姿态时才填，且不与 actions 重复安排同一变化。
-- 表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
-- 句间静默续演的独立 Motion.data.actions **一般不用**；确需一段纯表演桥段才用（wait:true，duration 为秒，默认 2，必须 >0 且 <=120；at 同样按该 duration 的比例），整场至多 1 次，且不能用它替代听者反应。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**说话的人 1~2 个动作、不说话的人 0~1 个动作**（最多 3 项），每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义做手势或表情转折（相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒）；听者稍后点头/疑惑/缓和，一条至多 1 次。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **动作要有语义，宁缺毋滥**：每个动作都要贴台词内容或情绪转折（说到某物时指一指、被戳中时惊讶、安心时松口气），禁止无意义的装饰性动作；没有贴合的动作就干脆不写。**不是每条台词都要动**：整场带 actions 的台词不超过三分之一，短句、平静语气、过渡句一律不安排。
+- 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
+- 表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
+- 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
 - 动作/表情须来自对应 modelId 的完整名称，清单的前缀 * 只是分组，不是资源名；仅用明确列出的完整样例或默认值，不猜编号。
 - **台词之间要有呼吸间隔**：换人 delay 取 0.1~0.2；同一人连续说话 delay 取 0.15~0.2
 - 每个 Talk 含 content（中文）和 ttsText（日文翻译），排版必须遵守下方「台词排版硬规则」
@@ -537,12 +536,10 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 3 项，每项至少 motion/facial 之一。
-- **只给说话的人安排动作，且尽可能少**：说话的人可以做动作，但一条台词通常 1 处就够、至多 2 处，相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。整场只有两三条关键台词带 actions（不超过四分之一），其余台词安静说完。
-- **不说话的人尽量不做动作**：听者默认完全安静，只有剧情特别需要时才给**整场唯一的一次**反应（一条至多 1 个动作），超出的会被系统自动删除。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
-- **动作要极少、极准**：动作必须贴说话内容或情绪转折，禁止无意义的装饰性动作；没有贴合的动作、觉得太杂就干脆不写。短句和平静语气不安排。
-- **旧 motion/facial 字段一般留空**：姿态会自然保持，只在台词开场就必须换姿态时才填，且不与 actions 重复。
-- 表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；保留自然停顿与安静倾听，不机关枪式换动作、不机械重复。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**说话的人 1~2 个动作、不说话的人 0~1 个动作**（最多 3 项），每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- **动作要有语义，宁缺毋滥**：动作要贴说话内容或情绪转折，禁止无意义的装饰性动作；没有贴合的动作就干脆不写，不是每条都要动。保留自然停顿与倾听，不机关枪式换动作、不机械重复。
+- 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
 - 可用动作：{motion_list}
@@ -1503,20 +1500,12 @@ class MySekaiStorytellerPlugin(Star):
     def _normalize_scene(self, story_data: dict) -> None:
         """插件的舞台约束；非法换人交给原有 LLM 重试，不删台词、不代选退场者。
 
-        表演配额在此硬执行（LLM 不自覺时兜底）：
-        - 带表演（actions/motion/facial）的台词整场至多 max(2, 台词数/4) 条，超出的改安静说完
-        - 听者反应全场至多 1 处（LLM 被要求"不说话的人尽量不做动作"）
-        - 句间静默表演桥段（带 actions 的 Motion）整场至多 1 个
+        单句表演配额（说话者 ≤2、听者 ≤1、同角色间隔 <0.3）在 _validate_actions 硬执行；
+        表演密度交给提示词把握，这里不再做整场预算。
         """
-        snippets = story_data["snippets"]
-        talk_count = sum(1 for s in snippets if s.get("type") == "Talk")
-        perform_budget = max(2, round(talk_count / 4))
-        perform_used = 0
-        listener_budget = 1
-        motion_bridge_budget = 1
         visible: dict[int, dict] = {}
         mode = None
-        for index, snippet in enumerate(snippets):
+        for index, snippet in enumerate(story_data["snippets"]):
             kind = snippet["type"]
             data = snippet.get("data", {})
             model_id = data.get("modelId")
@@ -1562,42 +1551,9 @@ class MySekaiStorytellerPlugin(Star):
                 for action in data.get("actions", []):
                     if action["modelId"] not in visible:
                         raise ValueError(f"{label}.actions 的角色 {action['modelId']} 不在场，不能表演听者反应")
+                # 静默片段完成后才能换人；听者在说话期间的反应只能放在 Talk.actions。
                 if kind == "Motion" and "actions" in data:
-                    # 句间表演桥段整场至多 1 个；超出的去掉 actions 退化为普通动作片段
-                    if motion_bridge_budget <= 0:
-                        logger.info(f"{label} 超出表演桥段预算（整场 1 个），已去掉 actions")
-                        data.pop("actions", None)
-                    else:
-                        motion_bridge_budget -= 1
                     snippet["wait"] = True
-                if kind == "Talk":
-                    # 表演台词预算：超出的台词一律安静说完（保留台词文本）
-                    if data.get("actions") or data.get("motion") or data.get("facial"):
-                        if perform_used >= perform_budget:
-                            if data.get("actions"):
-                                logger.info(f"{label} 超出整场表演台词预算（{perform_budget} 条），已去掉 actions")
-                                data["actions"] = []
-                            if model_id != -1 and (data.get("motion") or data.get("facial")):
-                                logger.info(f"{label} 超出整场表演台词预算（{perform_budget} 条），已去掉起始动作/表情")
-                                data["motion"], data["facial"] = "", ""
-                        else:
-                            perform_used += 1
-                    # 听者反应全场预算 1 处：LLM 被要求听者尽量不动，这里兜底硬删
-                    if data.get("actions") and listener_budget > 0:
-                        kept_actions = []
-                        for action in data["actions"]:
-                            if action["modelId"] != model_id and listener_budget <= 0:
-                                logger.info(f"{label}.actions 听者反应全场至多 1 处，已裁掉 {action.get('motion') or action.get('facial')}")
-                                continue
-                            if action["modelId"] != model_id:
-                                listener_budget -= 1
-                            kept_actions.append(action)
-                        data["actions"] = kept_actions
-                    elif data.get("actions") and listener_budget <= 0:
-                        kept_actions = [a for a in data["actions"] if a["modelId"] == model_id]
-                        if len(kept_actions) != len(data["actions"]):
-                            logger.info(f"{label}.actions 听者反应全场至多 1 处，已裁掉多余听者反应")
-                        data["actions"] = kept_actions
 
     @staticmethod
     def _split_tts_text(tts: str, group_count: int) -> list[str]:
