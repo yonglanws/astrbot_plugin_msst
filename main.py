@@ -446,9 +446,9 @@ LayoutAppear 与 LayoutClear 都只做**原地淡入/淡出**：from 和 to 完�
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 24 项，每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：开头轻微姿态、关键词处变化、听者稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **自然、克制、有意义**：依据台词语义和人设选择清单中的动作；有情绪转折的长句可有 2~4 次变化，短句可不变。不要机关枪式切换、每句重播同一动作或强迫每条都有表演。允许安静倾听与停顿。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 6 项，每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：听者稍后点头/疑惑/缓和，每条至多 1 次反应。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **自然、克制、少而慢**：动作是点缀，不是逐句表演。一条台词内最多 1~2 次变化，同一姿态至少保持约 2 秒（相邻 at 间隔 ≥0.25）；短句、平静语气、过渡句一律不安排。表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
 - 动作/表情须来自对应 modelId 的完整名称，清单的前缀 * 只是分组，不是资源名；仅用明确列出的完整样例或默认值，不猜编号。
@@ -532,9 +532,9 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 24 项，每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的点头/疑惑/缓和。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
-- 有转折的长句可有 2~4 次变化，短句可安静维持姿态；不是每条必须动。按台词意义和人设选择，不机关枪式换动作、不机械重复。保留自然停顿与倾听。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 6 项，每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- **少而慢**：一条台词最多 1~2 次变化，同一姿态至少保持约 2 秒（相邻 at 间隔 ≥0.25）；短句和平静语气不安排，不是每条都要动。不机关枪式换动作、不机械重复；保留自然停顿与倾听。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
 - 可用动作：{motion_list}
@@ -1411,8 +1411,10 @@ class MySekaiStorytellerPlugin(Star):
         if "actions" not in data:
             return
         actions = data["actions"]
-        if not isinstance(actions, list) or len(actions) > 24:
-            raise ValueError(f"{label}.actions 必须是最多 24 项的数组")
+        # 生成剧本走克制的表演节奏：少量、慢速的状态变化比频繁切换自然。
+        # 渲染层仍允许手工剧本最多 24 项，这里只约束插件产出。
+        if not isinstance(actions, list) or len(actions) > 6:
+            raise ValueError(f"{label}.actions 必须是最多 6 项的数组（动作是点缀，不要频繁切换）")
         normalized = []
         for index, action in enumerate(actions):
             where = f"{label}.actions[{index}]"
