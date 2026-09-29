@@ -449,9 +449,10 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 2 项，每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：说话者至多 1 次、听者至多 1 次。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **自然、克制、少而慢**：动作是点缀，不是逐句表演。**一条台词默认不安排 actions**，只有关键情绪转折才写；**整场带 actions 的台词不超过三分之一**，连续几条安静对话完全正常。短句、平静语气、过渡句一律不安排。相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 3 项（说话者至多 2 项、听者至多 1 项），每项至少 motion/facial 之一。
+- **动作要有语义，宁缺毋滥**：每个动作都要贴台词内容或情绪转折（说到某物时指一指、被戳中时惊讶、安心时松口气），禁止无意义的装饰性动作；没有贴合的动作、或觉得这段太杂，就干脆不写。**不是每条台词都要动**：整场带 actions 的台词不超过三分之一，短句、平静语气、过渡句一律不安排。
+- **说话者**可以随说话内容演（一条内至多 2 处变化，相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒）；**听者反应要更少**：一条至多 1 次，只挑最重要的转折给。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- 表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
 - 动作/表情须来自对应 modelId 的完整名称，清单的前缀 * 只是分组，不是资源名；仅用明确列出的完整样例或默认值，不猜编号。
@@ -535,8 +536,9 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 2 项，每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者的语义手势、表情转折，以及听者稍后的一次点头/疑惑/缓和。**一条台词默认不安排 actions**，只有关键情绪转折才写，**整场带 actions 的台词不超过三分之一**；相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，最多 3 项（说话者至多 2 项、听者至多 1 项），每项至少 motion/facial 之一。
+- **动作要有语义，宁缺毋滥**：动作要贴说话内容或情绪转折，禁止无意义的装饰性动作；没有贴合的动作、觉得太杂就干脆不写。**不是每条台词都要动**，整场带 actions 的台词不超过三分之一；相邻 at 间隔 ≥0.35，同一姿态至少保持约 3 秒。只换表情时不必填 motion。
+- **说话者**可随内容演（一条内至多 2 处变化）；**听者反应要更少**：一条至多 1 次，只挑最重要的转折给。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
 - 表情跟随整场情绪转折（一场约 2~3 次），不逐句重置；保留自然停顿与安静倾听，不机关枪式换动作、不机械重复。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
@@ -1443,7 +1445,7 @@ class MySekaiStorytellerPlugin(Star):
         if "actions" not in data:
             return
         actions = data["actions"]
-        # 生成剧本走克制的表演节奏：一条台词至多 2 处变化（说话者/听者各 1），
+        # 生成剧本走克制的表演节奏：说话者一条内至多 2 处变化、听者至多 1 次（合计 ≤3），
         # 变化之间至少隔 0.3；超出的部分直接裁掉，不触发整场重试。
         # 渲染层仍允许手工剧本最多 24 项，这里只约束插件产出。
         if not isinstance(actions, list) or len(actions) > 6:
@@ -1473,8 +1475,8 @@ class MySekaiStorytellerPlugin(Star):
         normalized.sort(key=lambda action: action["at"])
         spaced: list[dict] = []
         for action in normalized:
-            if len(spaced) >= 2:
-                logger.info(f"{label}.actions 超过 2 项，已裁掉多余变化（{action.get('motion') or action.get('facial')}）")
+            if len(spaced) >= 3:
+                logger.info(f"{label}.actions 超过 3 项（说话者 2 + 听者 1），已裁掉多余变化（{action.get('motion') or action.get('facial')}）")
                 continue
             if spaced and action["at"] - spaced[-1]["at"] < 0.3:
                 logger.info(f"{label}.actions 相邻变化间隔过近（<0.3），已裁掉 {action.get('motion') or action.get('facial')}")
