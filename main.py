@@ -452,7 +452,7 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 ## 对话规范
 
 - **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 2~3 个身体动作（带 motion 字段的项），身体动作尽量贯穿整句连续安排——时间富余就做满 3 个，节奏紧凑就 2 个，短促台词才降到 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义连续做手势和表情转折（相邻 at 间隔 ≥0.25）；听者在对方说话时也可以做表情和动作，稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义连续做手势和表情转折（相邻 at 间隔 ≥0.2）；听者在对方说话时也可以做表情和动作，稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
 - **动作要有语义、精美流畅**：每个动作都要贴台词内容和情节（说到某物时指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类）。动作之间衔接顺滑，跟着台词节奏从头到尾连续变化，不要都挤在句首或句尾，也不要说到后半句就僵住；相邻两句之间的姿势自然过渡，不要每句都摆回同一个起手式。禁止与台词无关的乱动，禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
@@ -539,7 +539,7 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 
 ## 表情与动作
 - **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 2~3 个身体动作（带 motion 字段的项），身体动作尽量贯穿整句连续安排——时间富余就做满 3 个，节奏紧凑就 2 个，短促台词才降到 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者连续的语义手势、表情转折，以及听者的表情和动作反应。相邻 at 间隔 ≥0.25。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- 同一 actions 可安排说话者连续的语义手势、表情转折，以及听者的表情和动作反应。相邻 at 间隔 ≥0.2。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
 - **动作要有语义、精美流畅**：动作要贴说话内容和情节（说到某物指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类）。动作之间衔接顺滑，跟着说话节奏从头到尾连续变化，不要都挤在句首或句尾，也不要说到后半句就僵住；相邻两句之间的姿势自然过渡，不要每句都摆回同一个起手式。禁止与台词无关的乱动，不机关枪式换动作、不每句重播同一动作。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
@@ -1544,7 +1544,7 @@ class MySekaiStorytellerPlugin(Star):
             return
         actions = data["actions"]
         # 单句表演配额兜底（超出直接裁掉，不触发整场重试）：说话者一句内可连续演，至多 5 处变化、
-        # 听者类事件（非说话者目标）至多 1 处、同一角色相邻变化至少隔 0.25。
+        # 听者类事件（非说话者目标）至多 1 处、同一角色相邻变化至少隔 0.2。
         # 渲染层仍允许手工剧本最多 24 项，这里只约束插件产出。
         if not isinstance(actions, list) or len(actions) > 8:
             raise ValueError(f"{label}.actions 必须是最多 8 项的数组")
@@ -1586,8 +1586,8 @@ class MySekaiStorytellerPlugin(Star):
                 if count >= cap:
                     logger.info(f"{label}.actions {cap_name}，已裁掉 {action.get('motion') or action.get('facial')}")
                     continue
-                if last_at is not None and action["at"] - last_at < 0.25:
-                    logger.info(f"{label}.actions 同一角色相邻变化间隔过近（<0.25），已裁掉 {action.get('motion') or action.get('facial')}")
+                if last_at is not None and action["at"] - last_at < 0.2 - 1e-9:
+                    logger.info(f"{label}.actions 同一角色相邻变化间隔过近（<0.2），已裁掉 {action.get('motion') or action.get('facial')}")
                     continue
                 kept.append(action)
                 last_at = action["at"]
@@ -1598,7 +1598,7 @@ class MySekaiStorytellerPlugin(Star):
     def _normalize_scene(self, story_data: dict) -> None:
         """插件的舞台约束；非法换人交给原有 LLM 重试，不删台词、不代选退场者。
 
-        单句表演配额（说话者 ≤5、听者 ≤1、同角色间隔 <0.25）在 _validate_actions 硬执行；
+        单句表演配额（说话者 ≤5、听者 ≤1、同角色间隔 <0.2）在 _validate_actions 硬执行；
         表演密度交给提示词把握，这里不再做整场预算。
         """
         visible: dict[int, dict] = {}
