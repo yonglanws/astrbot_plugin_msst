@@ -35,6 +35,10 @@ class QueueTask:
     timeout_seconds: int = 600
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    # 任务声明的进度上报参数名；声明后才注入回调（保持旧协程兼容）
+    progress_arg: Optional[str] = None
+    progress: int = 0
+    worker: Optional[asyncio.Task] = None
 
 
 class VideoExportQueue:
@@ -42,7 +46,8 @@ class VideoExportQueue:
 
     def __init__(self, max_concurrent: int = 2, max_queue_size: int = 30,
                  default_timeout: int = 600, default_max_retries: int = 1,
-                 cleanup_interval: int = 180, timeout_grace_seconds: int = 180):
+                 cleanup_interval: int = 180, timeout_grace_seconds: int = 180,
+                 progress_check_seconds: int = 30):
         self._queue: list[QueueTask] = []
         self._running_tasks: dict[str, QueueTask] = {}
         self._completed_tasks: dict[str, QueueTask] = {}
@@ -55,6 +60,8 @@ class VideoExportQueue:
         self._task_events: dict[str, asyncio.Event] = {}
         self._cleanup_interval = cleanup_interval
         self._timeout_grace_seconds = timeout_grace_seconds
+        # 超时后的进度检查步长：一个步长内没有任何进展才判超时
+        self._progress_check_seconds = max(1, progress_check_seconds)
         self._cleanup_task: Optional[asyncio.Task] = None
         self._processor_task: Optional[asyncio.Task] = None
         self._running = False
@@ -77,7 +84,7 @@ class VideoExportQueue:
             logger.info(f"视频导出队列已启动（并发={self._max_concurrent}, 容量={self._max_queue_size}）")
 
     async def stop(self):
-        """停止队列处理器"""
+        """停止队列处理器，并收尾所有排队/运行中的任务（等待方会被唤醒）"""
         self._running = False
         if self._processor_task:
             self._processor_task.cancel()
@@ -93,12 +100,31 @@ class VideoExportQueue:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
+
+        async with self._lock:
+            pending = [t for t in self._queue if t.status == TaskStatus.PENDING]
+            self._queue = [t for t in self._queue if t.status != TaskStatus.PENDING]
+            running = list(self._running_tasks.values())
+        for task in pending:
+            self._settle(task, TaskStatus.CANCELLED, error="队列已停止")
+        workers = [t.worker for t in running if t.worker and not t.worker.done()]
+        for task in running:
+            if task.worker and not task.worker.done():
+                task.worker.cancel()
+        # 等被取消的协程真正退出（清理逻辑跑完），stop 返回后即无残留后台任务
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         logger.info("视频导出队列已停止")
 
     async def add_task(self, user_id: str, coroutine_func: Callable,
                        priority: int = 0, args: tuple = (), kwargs: dict = None,
-                       timeout_seconds: int = None, max_retries: int = None) -> str:
-        """添加任务到队列（优化版：支持用户任务聚合）"""
+                       timeout_seconds: int = None, max_retries: int = None,
+                       progress_arg: str = None) -> str:
+        """添加任务到队列（优化版：支持用户任务聚合）
+
+        progress_arg：任务协程中用于接收进度回调的参数名。声明后，队列会在执行时
+        注入 ``async def report(value)`` 回调；超时后的收尾宽限据此判断任务是否仍在推进。
+        """
         async with self._lock:
             pending_and_running = (
                 sum(1 for t in self._queue if t.status == TaskStatus.PENDING)
@@ -122,7 +148,8 @@ class VideoExportQueue:
                 args=args,
                 kwargs=kwargs or {},
                 timeout_seconds=timeout,
-                max_retries=retries
+                max_retries=retries,
+                progress_arg=progress_arg
             )
 
             # 高并发优化：检查同一用户是否已有pending任务，进行智能排序
@@ -145,6 +172,13 @@ class VideoExportQueue:
                         f"用户pending={user_pending_count}")
 
             return task_id
+
+    async def update_progress(self, task_id: str, progress: int) -> None:
+        """上报任务进度（0-100）。超时后的进度监控据此判断导出是否仍在推进。"""
+        async with self._lock:
+            task = self._find_task(task_id)
+            if task and task.status == TaskStatus.RUNNING:
+                task.progress = max(0, min(100, int(progress)))
 
     async def get_task_status(self, task_id: str) -> Optional[dict]:
         """获取任务状态"""
@@ -190,26 +224,27 @@ class VideoExportQueue:
         return await self.get_task_status(task_id)
 
     async def cancel_task(self, task_id: str) -> bool:
-        """取消任务"""
+        """取消任务
+
+        排队中的任务直接置为取消；运行中的任务取消其协程（由执行协程负责结算终态）。
+        """
         async with self._lock:
             task = self._find_task(task_id)
             if not task:
                 return False
 
             if task.status == TaskStatus.PENDING:
-                task.status = TaskStatus.CANCELLED
                 self._queue.remove(task)
-                if task_id in self._task_events:
-                    self._task_events[task_id].set()
-                self._stats["total_cancelled"] += 1
+                self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
                 logger.info(f"任务已取消: {task_id[:8]}")
                 return True
-            elif task.status == TaskStatus.RUNNING:
-                task.status = TaskStatus.CANCELLED
-                if task_id in self._task_events:
-                    self._task_events[task_id].set()
-                self._stats["total_cancelled"] += 1
-                logger.info(f"运行中任务已标记取消: {task_id[:8]}")
+            if task.status == TaskStatus.RUNNING:
+                if task.worker and not task.worker.done():
+                    task.worker.cancel()
+                    logger.info(f"运行中任务已请求取消: {task_id[:8]}")
+                    return True
+                self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
+                logger.info(f"运行中任务已取消: {task_id[:8]}")
                 return True
 
             return False
@@ -322,94 +357,184 @@ class VideoExportQueue:
         async with self._semaphore:
             await self._execute_task(task)
 
-    async def _execute_task(self, task: QueueTask):
-        """执行单个任务"""
-        try:
-            # 不用 wait_for：超时后仍让导出协程收尾，避免视频已下完却被取消。
-            worker = asyncio.create_task(task.coroutine_func(*task.args, **task.kwargs))
+    async def _invoke(self, task: QueueTask):
+        """调用任务协程；仅在任务声明了 progress_arg 时注入进度回调（旧协程不受影响）。"""
+        kwargs = dict(task.kwargs)
+        if task.progress_arg:
+            kwargs[task.progress_arg] = self._progress_callback(task.task_id)
+        return await task.coroutine_func(*task.args, **kwargs)
+
+    def _progress_callback(self, task_id: str):
+        async def report(value: int):
+            await self.update_progress(task_id, value)
+        return report
+
+    def _settle(self, task: QueueTask, status: TaskStatus, error: Optional[str] = None) -> bool:
+        """结算任务终态（幂等）。调用方不得持有会与 _settle 内部操作冲突的假设；
+        本方法只做同步字段写入与事件置位，不获取 _lock。"""
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
+                           TaskStatus.TIMEOUT, TaskStatus.CANCELLED):
+            return False
+        task.status = status
+        if error is not None:
+            task.error = error
+        task.completed_at = time.time()
+        if status == TaskStatus.COMPLETED:
+            self._stats["total_completed"] += 1
+        elif status in (TaskStatus.FAILED, TaskStatus.TIMEOUT):
+            self._stats["total_failed"] += 1
+        elif status == TaskStatus.CANCELLED:
+            self._stats["total_cancelled"] += 1
+        self._completed_tasks[task.task_id] = task
+        self._running_tasks.pop(task.task_id, None)
+        event = self._task_events.get(task.task_id)
+        if event:
+            event.set()
+        return True
+
+    async def _await_grace(self, task: QueueTask, worker: asyncio.Task):
+        """看门狗到点后的收尾宽限。
+
+        视频导出常在合流/下载阶段越过时限：只要任务仍在推进（进度上报递增）就继续等；
+        静默超过一个宽限窗口、或到达绝对上限才取消，避免误杀即将完成的导出。
+        """
+        grace = self._timeout_grace_seconds
+        step = self._progress_check_seconds
+        started = task.started_at or time.time()
+        hard_deadline = started + task.timeout_seconds + 3 * grace
+        last_seen = task.progress
+        last_change = time.time()
+        landing_done = False
+        logger.warning(
+            f"任务到达执行时限，进入收尾宽限（{grace}s 静默判停，有进度则顺延）: "
+            f"{task.task_id[:8]}, 用户={task.user_id}"
+        )
+        while not worker.done():
+            now = time.time()
+            if now >= hard_deadline:
+                break
+            if now - last_change >= grace:
+                if not landing_done:
+                    # 落点窗口：让在途的进度上报先结算，再判定是否真的停滞
+                    landing_done = True
+                    await asyncio.sleep(0)
+                    if task.progress > last_seen:
+                        last_seen = task.progress
+                        last_change = time.time()
+                        landing_done = False
+                        logger.info(
+                            f"任务超时后仍在推进（进度 {task.progress}%），宽限顺延: "
+                            f"{task.task_id[:8]}"
+                        )
+                        continue
+                break
+            remaining = min(step, hard_deadline - now, last_change + grace - now)
             try:
-                result = await asyncio.wait_for(asyncio.shield(worker), timeout=task.timeout_seconds)
-                task.status = TaskStatus.COMPLETED
-                task.result = result
-                task.completed_at = time.time()
-                self._stats["total_completed"] += 1
-
-                logger.info(f"任务完成: {task.task_id[:8]}, "
-                            f"耗时={int(task.completed_at - task.started_at)}秒")
-
-            except asyncio.TimeoutError:
-                grace_seconds = min(self._timeout_grace_seconds, max(1, task.timeout_seconds // 10 or 1))
-                logger.warning(
-                    f"任务到达时限，等待收尾 {grace_seconds}s: {task.task_id[:8]}, "
-                    f"用户={task.user_id}"
+                result = await asyncio.wait_for(
+                    asyncio.shield(worker), timeout=max(remaining, 0.001)
                 )
-                try:
-                    result = await asyncio.wait_for(asyncio.shield(worker), timeout=grace_seconds)
-                    task.status = TaskStatus.COMPLETED
-                    task.result = result
-                    task.completed_at = time.time()
-                    self._stats["total_completed"] += 1
+                task.result = result
+                self._settle(task, TaskStatus.COMPLETED)
+                logger.info(
+                    f"任务在宽限期内完成: {task.task_id[:8]}, "
+                    f"耗时={int((task.completed_at or time.time()) - started)}秒"
+                )
+                return
+            except asyncio.TimeoutError:
+                if worker.done() and not worker.cancelled():
+                    worker.result()  # 任务自身抛错（含其内部超时）→ 交由失败/重试路径
+                if task.progress > last_seen:
+                    last_seen = task.progress
+                    last_change = time.time()
+                    landing_done = False
                     logger.info(
-                        f"任务在宽限期内完成: {task.task_id[:8]}, "
-                        f"耗时={int(task.completed_at - task.started_at)}秒"
+                        f"任务超时后仍在推进（进度 {task.progress}%），宽限顺延: "
+                        f"{task.task_id[:8]}"
                     )
-                except asyncio.TimeoutError:
-                    worker.cancel()
-                    try:
-                        await worker
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    task.status = TaskStatus.TIMEOUT
-                    task.error = f"任务超时（{task.timeout_seconds}秒）"
-                    task.completed_at = time.time()
-                    self._stats["total_failed"] += 1
-                    logger.warning(f"任务超时: {task.task_id[:8]}, 用户={task.user_id}")
+        if not worker.done():
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+        if worker.cancelled() or not worker.done():
+            self._settle(task, TaskStatus.TIMEOUT, error=f"任务超时（{task.timeout_seconds}秒）")
+            logger.warning(f"任务超时且无进展: {task.task_id[:8]}, 用户={task.user_id}")
+        elif worker.exception() is not None:
+            raise worker.exception()
+        else:
+            task.result = worker.result()
+            self._settle(task, TaskStatus.COMPLETED)
+            logger.info(f"任务在宽限期末尾完成: {task.task_id[:8]}")
 
-            except asyncio.CancelledError:
-                task.status = TaskStatus.CANCELLED
-                task.error = "任务已取消"
-                task.completed_at = time.time()
-                self._stats["total_cancelled"] += 1
-                logger.info(f"任务已取消: {task.task_id[:8]}")
-            except Exception as e:
-                task.error = str(e)
-                logger.error(f"任务执行失败: {task.task_id[:8]}, 错误={e}")
+    async def _handle_failure(self, task: QueueTask, error: Exception):
+        """任务协程抛错：按重试预算重新入队或结算为失败。"""
+        logger.error(f"任务执行失败: {task.task_id[:8]}, 错误={error}")
+        if task.retry_count < task.max_retries:
+            task.retry_count += 1
+            task.status = TaskStatus.PENDING
+            task.started_at = None
+            task.progress = 0
+            task.error = None
 
-                if task.retry_count < task.max_retries:
-                    task.retry_count += 1
-                    task.status = TaskStatus.PENDING
-                    task.started_at = None
-                    task.error = None
+            async with self._lock:
+                if not any(t.task_id == task.task_id for t in self._queue):
+                    self._queue.append(task)
+                    self._queue.sort(key=lambda t: (t.priority, t.created_at))
 
-                    async with self._lock:
-                        if not any(t.task_id == task.task_id for t in self._queue):
-                            self._queue.append(task)
-                            self._queue.sort(key=lambda t: (t.priority, t.created_at))
+            logger.info(f"任务将重试: {task.task_id[:8]}, 第{task.retry_count}次重试")
+        else:
+            self._settle(task, TaskStatus.FAILED, error=str(error))
+            logger.error(f"任务最终失败: {task.task_id[:8]}, 已重试{task.retry_count}次")
 
-                    logger.info(f"任务将重试: {task.task_id[:8]}, "
-                                f"第{task.retry_count}次重试")
+    async def _execute_task(self, task: QueueTask):
+        """执行单个任务。
+
+        超时只从任务实际开始执行起计（排队等待不占用）；到点后进入收尾宽限而非立刻取消，
+        已下载完成的视频不会被误杀。取消（用户/停止队列）会真正中断协程并释放并发槽。
+        """
+        worker = None
+        try:
+            worker = asyncio.create_task(self._invoke(task))
+            task.worker = worker
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(worker), timeout=task.timeout_seconds
+                )
+                task.result = result
+                self._settle(task, TaskStatus.COMPLETED)
+                logger.info(f"任务完成: {task.task_id[:8]}, "
+                            f"耗时={int(time.time() - (task.started_at or time.time()))}秒")
+            except asyncio.TimeoutError:
+                if worker.done() and not worker.cancelled():
+                    # 任务自身恰好抛出 TimeoutError：与看门狗超时区分，走失败/重试路径
+                    exc = worker.exception()
+                    if exc is None:
+                        task.result = worker.result()
+                        self._settle(task, TaskStatus.COMPLETED)
+                    else:
+                        raise exc
                 else:
-                    task.status = TaskStatus.FAILED
-                    task.completed_at = time.time()
-                    self._stats["total_failed"] += 1
-                    logger.error(f"任务最终失败: {task.task_id[:8]}, "
-                                 f"已重试{task.retry_count}次")
-
+                    await self._await_grace(task, worker)
+            except asyncio.CancelledError:
+                raise
+        except asyncio.CancelledError:
+            if worker and not worker.done():
+                worker.cancel()
+                try:
+                    await worker
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
+            logger.info(f"任务已取消: {task.task_id[:8]}")
+        except Exception as e:
+            await self._handle_failure(task, e)
         finally:
             async with self._lock:
-                if task.task_id in self._running_tasks:
-                    del self._running_tasks[task.task_id]
-
-                # 仅在终态唤醒等待方；重试入队时保持 Event 未置位，避免监控器提前报异常
-                if task.status in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.TIMEOUT,
-                    TaskStatus.CANCELLED,
-                ):
-                    self._completed_tasks[task.task_id] = task
-                    if task.task_id in self._task_events:
-                        self._task_events[task.task_id].set()
+                self._running_tasks.pop(task.task_id, None)
+            # 防御：正常路径都会先行结算；若仍处于 RUNNING 说明有未覆盖的退出路径
+            if task.status == TaskStatus.RUNNING:
+                self._settle(task, TaskStatus.FAILED, error="任务异常退出")
 
     async def _cleanup_loop(self):
         """定期清理已完成的任务"""

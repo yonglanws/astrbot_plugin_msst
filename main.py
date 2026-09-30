@@ -1913,7 +1913,7 @@ class MySekaiStorytellerPlugin(Star):
         logger.error(f"无法从响应中提取 JSON: {response[:200]}...")
         return None
 
-    async def _export_video(self, story_data: dict, timeout: int = 600) -> dict:
+    async def _export_video(self, story_data: dict, timeout: int = 600, progress=None) -> dict:
         """调用 MSS API 导出视频，并下载到本地"""
         try:
             export_timeout_ms = timeout * 1000
@@ -1942,6 +1942,8 @@ class MySekaiStorytellerPlugin(Star):
                 }
 
             result = response.json()
+            if progress:
+                await progress(60)
             if not result.get("success"):
                 return result
 
@@ -1968,6 +1970,8 @@ class MySekaiStorytellerPlugin(Star):
                             timestamp = int(time.time())
                             local_path = str(self.video_dir / f"video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4")
                             logger.info(f"[调试] 生成的本地路径：{local_path}")
+                            if progress:
+                                await progress(90)
                             with open(local_path, "wb") as f:
                                 f.write(dl_response.content)
                             logger.info(f"Video downloaded: {local_path} ({len(dl_response.content)} bytes)")
@@ -2171,7 +2175,7 @@ class MySekaiStorytellerPlugin(Star):
     async def _monitor_and_send_video(self, task_id: str, event: AstrMessageEvent, event_context: dict = None):
         """监控任务完成并发送视频"""
         try:
-            result = await self.export_queue.wait_for_task(task_id, timeout=self.export_timeout + 120)
+            result = await self.export_queue.wait_for_task(task_id, timeout=None)
 
             if not result:
                 await self._send_safe_message(event, self._user_error("timeout"), event_context)
@@ -2485,7 +2489,8 @@ class MySekaiStorytellerPlugin(Star):
                     "sender_id": user_id,
                     "description": description,
                     "event_context": event_context
-                }
+                },
+                progress_arg="progress"
             )
         except QueueFullError:
             await self._send_safe_message(event, "剧本已生成，但渲染队列已满，请稍后再试", event_context)
@@ -2525,7 +2530,7 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"剧本生成失败: {e}")
             await self._send_safe_message(event, self._user_error(e), event_context)
 
-    async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频", event_context: dict = None) -> dict:
+    async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频", event_context: dict = None, progress=None) -> dict:
         """队列任务调用的视频导出方法"""
         timestamp = int(time.time())
         story_path = self.story_dir / f"story_{timestamp}_{uuid.uuid4().hex[:8]}.json"
@@ -2541,7 +2546,7 @@ class MySekaiStorytellerPlugin(Star):
         start_time = time.time()
 
         try:
-            result = await self._export_video(story_data, self.export_timeout)
+            result = await self._export_video(story_data, self.export_timeout, progress)
 
             self.active_exports.discard(task_key)
             elapsed = int(time.time() - start_time)
