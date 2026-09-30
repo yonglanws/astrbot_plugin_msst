@@ -2502,7 +2502,7 @@ class MySekaiStorytellerPlugin(Star):
         if position > 0:
             est_min, est_max = self._calculate_wait_time(position, wait_kind)
             return self._format_queue_message(position, est_min, est_max)
-        return f"视频生成中...\n预计等待：1-3分钟"
+        return "视频生成中，生成时间较久，请耐心等待...."
 
     async def _enqueue_export_and_monitor(self, event, event_context: dict, user_id: str,
                                           story_data: dict, description: str,
