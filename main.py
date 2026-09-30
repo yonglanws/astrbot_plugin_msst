@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import gzip
 import json
 import math
 import os
@@ -8,6 +9,7 @@ import time
 import shutil
 import socket
 import uuid
+import zlib
 import httpx
 from pathlib import Path
 from typing import Optional
@@ -966,28 +968,113 @@ class MySekaiStorytellerPlugin(Star):
         except Exception as e:
             return {"status": "error", "message": f"连接失败: {str(e)}"}
 
-    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
-        """通过 Astrbot 已配置的 LLM 提供商调用 AI"""
-        try:
-            provider = self._get_provider()
-            if not provider:
-                logger.error("LLM 提供商未配置")
-                return None
+    # LLM 网关偶发返回压缩体或非 UTF-8 错误页（UnicodeDecodeError 等），多为瞬时故障；
+    # 按固定退避重试，重试间隔同时被剧本外层重试与单测复用
+    LLM_RETRY_DELAYS = (1.0, 3.0)
 
-            llm_resp = await provider.text_chat(
-                prompt=prompt,
-                context=[],
-                system_prompt=system_prompt,
-            )
+    @staticmethod
+    def _describe_llm_error(e: Exception) -> str:
+        """把 LLM 调用异常归类成一句可读原因，便于日志定位与后续提示。"""
+        if isinstance(e, UnicodeDecodeError):
+            return (f"响应内容无法按 UTF-8 解码（{e}）——常见于中转网关返回了压缩响应体"
+                    "或非 UTF-8 错误页，请检查模型服务商/中转配置")
+        name = type(e).__name__
+        text = str(e)
+        lowered = text.lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            return f"请求超时（{name}: {text}）"
+        if "connect" in lowered:
+            return f"连接失败（{name}: {text}）"
+        if "429" in text or "rate limit" in lowered:
+            return f"触发限流（{name}: {text}）"
+        return f"{name}: {text}"
 
-            if llm_resp and llm_resp.completion_text:
-                return llm_resp.completion_text.strip()
+    async def _text_chat_with_retry(self, prompt: str, system_prompt: Optional[str], label: str) -> Optional[str]:
+        """带重试与异常分类的 text_chat 封装；重试耗尽返回 None，不抛异常。
 
-            logger.error("LLM 响应为空")
+        每次异常连同堆栈记入日志（便于定位是网关压缩体、超时还是配置问题），
+        最终失败时汇总分类原因。
+        """
+        provider = self._get_provider()
+        if not provider:
+            logger.error(f"{label}: LLM 提供商未配置")
             return None
 
-        except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
+        last_reason = "LLM 响应为空"
+        for attempt in range(len(self.LLM_RETRY_DELAYS) + 1):
+            if attempt:
+                delay = self.LLM_RETRY_DELAYS[attempt - 1]
+                logger.info(f"{label}: {delay} 秒后进行第 {attempt + 1} 次尝试")
+                await asyncio.sleep(delay)
+            try:
+                llm_resp = await provider.text_chat(
+                    prompt=prompt,
+                    context=[],
+                    system_prompt=system_prompt,
+                )
+            except Exception as e:
+                last_reason = self._describe_llm_error(e)
+                logger.warning(f"{label}: 调用异常 — {last_reason}", exc_info=True)
+                continue
+            text = llm_resp.completion_text if llm_resp else None
+            if text and text.strip():
+                return text.strip()
+            last_reason = "LLM 响应为空"
+            logger.warning(f"{label}: {last_reason}")
+        logger.error(f"{label}失败（重试 {len(self.LLM_RETRY_DELAYS)} 次后放弃）— {last_reason}")
+        return None
+
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
+        """通过 Astrbot 已配置的 LLM 提供商调用 AI（带重试与异常分类）"""
+        return await self._text_chat_with_retry(prompt, system_prompt, "LLM 调用")
+
+    @staticmethod
+    def _http_body_text(response) -> str:
+        """尽力把 HTTP 响应体解成可读文本。
+
+        httpx 未安装 brotli 包时，若网关无视 Accept-Encoding 强推 Brotli，
+        响应体就是二进制垃圾；这里按 Content-Encoding 手工解压兜底
+        （gzip/deflate 可能已被 httpx 解压过，解压失败则沿用原字节），
+        再依次尝试 UTF-8 / GB18030，最后 replace 解码，保证日志可读、不抛异常。
+        """
+        raw = response.content or b""
+        encoding = (response.headers.get("content-encoding") or "").lower()
+        if "br" in encoding:
+            try:
+                import brotli
+                raw = brotli.decompress(raw)
+            except ImportError:
+                logger.warning("响应为 Brotli 压缩但运行环境未安装 brotli 包，无法解压"
+                               "（可在 AstrBot 环境执行 pip install brotli）")
+            except Exception as e:
+                logger.warning(f"Brotli 解压失败: {e}")
+        elif "gzip" in encoding:
+            try:
+                raw = gzip.decompress(raw)
+            except Exception as e:
+                logger.debug(f"gzip 手工解压跳过（可能已被 httpx 解压）: {e}")
+        elif "deflate" in encoding:
+            try:
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error:
+                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+            except Exception as e:
+                logger.debug(f"deflate 手工解压跳过（可能已被 httpx 解压）: {e}")
+        for charset in ("utf-8", "gb18030"):
+            try:
+                return raw.decode(charset)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    def _json_from_response(self, response):
+        """解析 JSON 响应体；失败时记录可读的正文摘录并返回 None。"""
+        text = self._http_body_text(response)
+        try:
+            return json.loads(text)
+        except ValueError as e:
+            logger.warning(f"响应体不是合法 JSON: {e}; 正文开头: {text[:200]}")
             return None
 
     def _strip_translation(self, translated: str) -> str:
@@ -999,34 +1086,23 @@ class MySekaiStorytellerPlugin(Star):
         return translated.strip()
 
     async def _translate_text(self, text: str, source_lang: str = "zh", target_lang: str = "ja") -> str:
-        """使用 Astrbot 已配置的 LLM 提供商翻译文本"""
+        """使用 Astrbot 已配置的 LLM 提供商翻译文本；调用失败或翻译无效时回退原文"""
         if not text or not text.strip():
             return text
 
-        try:
-            provider = self._get_provider()
-            if not provider:
-                logger.warning("LLM 提供商未配置，跳过翻译")
-                return text
+        translated = await self._text_chat_with_retry(
+            prompt=text,
+            system_prompt=f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Only return the translated text, no explanations, no quotes, no additional formatting.",
+            label="翻译",
+        )
+        if translated:
+            cleaned = self._strip_translation(translated)
+            if cleaned and cleaned != text:
+                logger.info(f"翻译: {text[:30]}... -> {cleaned[:30]}...")
+                return cleaned
 
-            llm_resp = await provider.text_chat(
-                prompt=text,
-                context=[],
-                system_prompt=f"You are a professional translator. Translate the following text from {source_lang} to {target_lang}. Only return the translated text, no explanations, no quotes, no additional formatting."
-            )
-
-            if llm_resp and llm_resp.completion_text:
-                translated = self._strip_translation(llm_resp.completion_text)
-                if translated and translated != text:
-                    logger.info(f"翻译: {text[:30]}... -> {translated[:30]}...")
-                    return translated
-
-            logger.warning(f"翻译失败，使用原文: {text[:30]}...")
-            return text
-
-        except Exception as e:
-            logger.warning(f"翻译异常，使用原文: {e}")
-            return text
+        logger.warning(f"翻译失败，使用原文: {text[:30]}...")
+        return text
 
     async def _ensure_tts_text(self, story_data: dict) -> dict:
         """确保所有 Talk 片段都有 ttsText；缺失时批量一次翻译，避免逐条串行 LLM。"""
@@ -1059,18 +1135,16 @@ class MySekaiStorytellerPlugin(Star):
 
         numbered = "\n".join(f"{i + 1}. {content}" for i, (_, _, content) in enumerate(need_translate))
         try:
-            llm_resp = await provider.text_chat(
+            llm_text = await self._text_chat_with_retry(
                 prompt=numbered,
-                context=[],
                 system_prompt=(
                     "You are a professional translator. Translate each numbered Chinese line to Japanese. "
                     "Return ONLY a JSON array of strings, one translation per input line, same order. "
                     "No explanations, no markdown."
                 ),
+                label="批量翻译",
             )
-            translations = None
-            if llm_resp and llm_resp.completion_text:
-                translations = self._extract_json_from_response(llm_resp.completion_text)
+            translations = self._extract_json_from_response(llm_text) if llm_text else None
             if isinstance(translations, list) and len(translations) == len(need_translate):
                 for (snippet, data, _), translated in zip(need_translate, translations):
                     data["ttsText"] = self._strip_translation(str(translated)) or data.get("content", "")
@@ -1134,7 +1208,10 @@ class MySekaiStorytellerPlugin(Star):
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+            "Authorization": f"Bearer {api_key}",
+            # 明确只接受 gzip/deflate：部分中转网关会给未声明 br 的客户端强推 Brotli，
+            # httpx 未装 brotli 包时解不开，读取响应会变成 UTF-8 解码错误
+            "Accept-Encoding": "gzip, deflate",
         }
 
         messages = []
@@ -1151,23 +1228,31 @@ class MySekaiStorytellerPlugin(Star):
         }
 
         client = await self._get_http_client()
-        response = await client.post(url, headers=headers, json=body, timeout=120.0)
-
-        if response.status_code != 200:
-            error_text = response.text[:300]
-            logger.warning(f"json_object 模式返回 HTTP {response.status_code}: {error_text}")
-            body.pop("response_format", None)
-            response = await client.post(url, headers=headers, json=body, timeout=120.0)
-            if response.status_code != 200:
-                return None
-
-            data = response.json()
-            if data.get("choices") and len(data["choices"]) > 0:
-                content = data["choices"][0].get("message", {}).get("content", "")
-                if content and content.strip():
-                    return content.strip()
-
+        response = None
+        # 第一次带 response_format；被网关拒绝（4xx）时去掉该参数重试一次
+        for attempt, use_json_format in enumerate((True, False), start=1):
+            payload = dict(body)
+            if not use_json_format:
+                payload.pop("response_format", None)
+            response = await client.post(url, headers=headers, json=payload, timeout=120.0)
+            if response.status_code == 200:
+                break
+            logger.warning(
+                f"json_object 模式返回 HTTP {response.status_code}（第 {attempt} 次尝试）: "
+                f"{self._http_body_text(response)[:300]}"
+            )
+        if response is None or response.status_code != 200:
             return None
+
+        data = self._json_from_response(response)
+        if not isinstance(data, dict):
+            return None
+        choices = data.get("choices") or []
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            if content and content.strip():
+                return content.strip()
+        return None
 
     def _persona_registry(self, view) -> PersonaRegistry:
         """从当前插件配置解析人格注册表，并把告警写入日志。"""
@@ -2052,6 +2137,8 @@ class MySekaiStorytellerPlugin(Star):
             return "渲染服务正忙，请稍后再试"
         if "未配置" in text or "llm" in lower:
             return "语言模型未就绪，请稍后再试或联系管理员"
+        if "utf-8" in lower or "解码" in text or "decode" in lower:
+            return "模型服务返回了异常内容，请稍后再试；若反复出现请联系管理员检查模型中转配置"
         if len(text) > 80 or "traceback" in lower or "/" in text or "\\" in text:
             return "视频生成失败，请稍后重试"
         return f"视频生成失败：{text}"
@@ -2403,10 +2490,15 @@ class MySekaiStorytellerPlugin(Star):
         system_prompt, user_prompt = await self._build_chat_prompt(message, user_id)
         max_retries = 2
         story_data = None
+        last_failure = "LLM 未返回内容"
 
         for attempt in range(max_retries + 1):
             llm_response = await self._call_llm_structured(user_prompt, system_prompt)
             if not llm_response:
+                last_failure = "LLM 调用失败"
+                if attempt < max_retries:
+                    logger.warning(f"LLM 未返回内容，重试 ({attempt + 1}/{max_retries})")
+                    await asyncio.sleep(1.0)
                 continue
 
             story_data = self._extract_json_from_response(llm_response)
@@ -2427,7 +2519,7 @@ class MySekaiStorytellerPlugin(Star):
                 raise e
 
         if not story_data:
-            raise ValueError("AI 返回的内容无法解析为 JSON")
+            raise ValueError(f"{last_failure}（已重试 {max_retries} 次，请稍后再试）")
 
         story_data = await self._ensure_tts_text(story_data)
 
@@ -2447,10 +2539,15 @@ class MySekaiStorytellerPlugin(Star):
         system_prompt, user_prompt = await self._build_prompt(scene)
         max_retries = 2
         story_data = None
+        last_failure = "LLM 未返回内容"
 
         for attempt in range(max_retries + 1):
             llm_response = await self._call_llm_structured(user_prompt, system_prompt)
             if not llm_response:
+                last_failure = "LLM 调用失败"
+                if attempt < max_retries:
+                    logger.warning(f"LLM 未返回内容，重试 ({attempt + 1}/{max_retries})")
+                    await asyncio.sleep(1.0)
                 continue
 
             story_data = self._extract_json_from_response(llm_response)
@@ -2471,7 +2568,7 @@ class MySekaiStorytellerPlugin(Star):
                 raise e
 
         if not story_data:
-            raise ValueError("AI 返回的内容无法解析为 JSON")
+            raise ValueError(f"{last_failure}（已重试 {max_retries} 次，请稍后再试）")
 
         return await self._ensure_tts_text(story_data)
 
