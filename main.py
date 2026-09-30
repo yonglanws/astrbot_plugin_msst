@@ -449,9 +449,9 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 
 ## 对话规范
 
-- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 1~2 个身体动作（带 motion 字段的项）——一句里塞得下两个就连续安排两个，节奏不合适就只做 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
-- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义连续做手势和表情转折（相邻 at 间隔 ≥0.3）；听者在对方说话时也可以做表情和动作，稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
-- **动作要有语义、精美流畅**：每个动作都要贴台词内容和情节（说到某物时指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类），动作之间衔接顺滑。禁止与台词无关的乱动，禁止机关枪式切换、每句重播同一动作。
+- **连续表演写在 Talk.data.actions**：[{"at":0.15,"modelId":角色ID,"motion":"完整动作名","facial":"完整表情名"}, ...]。at 是该 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 2~3 个身体动作（带 motion 字段的项），身体动作尽量贯穿整句连续安排——时间富余就做满 3 个，节奏紧凑就 2 个，短促台词才降到 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
+- 同一 Talk.actions 可同时安排说话者与在场听者：说话者按台词语义连续做手势和表情转折（相邻 at 间隔 ≥0.25）；听者在对方说话时也可以做表情和动作，稍后点头/疑惑/缓和。监听角色只做动作表情，不伪造嘴型或添加假台词；不要在 Talk 后加 Motion(wait:false) 冒充说话期间反应。
+- **动作要有语义、精美流畅**：每个动作都要贴台词内容和情节（说到某物时指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类）。动作之间衔接顺滑，跟着台词节奏从头到尾连续变化，不要都挤在句首或句尾，也不要说到后半句就僵住；相邻两句之间的姿势自然过渡，不要每句都摆回同一个起手式。禁止与台词无关的乱动，禁止机关枪式切换、每句重播同一动作。
 - 旧 motion/facial 字段可选，仅作 at=0 起始姿态兜底；不要与 actions 重复安排同一变化。只需换表情时省略 motion。
 - 表情跟随情绪转折而非逐句重置；允许整段安静倾听。禁止机关枪式切换、每句重播同一动作。
 - 句间静默续演才用独立 Motion.data.actions，wait:true，duration 为秒（默认 2，必须 >0 且 <=120）；at 同样按该 duration 的比例。不能用它替代 Talk 内听者反应。
@@ -503,7 +503,7 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
 3. models 的 id 和路径必须与对照表一致，多角色绝不能写成同一个模型；数组顺序与登场顺序一致
 4. 所有 Talk/Motion/LayoutAppear/LayoutClear 的 modelId：{id_mapping}
-5. 每条 Talk 含 content、ttsText；**每条都必须写 actions**（说话的人 1~2 个身体动作、表情另加，不说话的人 0~1 个；动作幅度小而自然，禁止大动作）；动作/表情必须来自各自角色清单
+5. 每条 Talk 含 content、ttsText；**每条都必须写 actions**（说话的人 2~3 个身体动作、表情另加，不说话的人 0~1 个；动作幅度小而自然，禁止大动作）；动作/表情必须来自各自角色清单
 6. 台词排版遵守「台词排版硬规则」：换行写作 \n、禁止连续 \n、每行不超 26 字宽、每条最多 3 行；超行拆成连续多条 Talk，话量不减
 7. delay 用 0、0.05、0.1、0.15、0.2
 8. 背景必须从「可用背景」清单按场景内容选择，禁止编造不存在的文件名
@@ -536,9 +536,9 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 - 不讨论插件、脚本、渲染等技术细节；不主动提起性别或 CP 话题
 
 ## 表情与动作
-- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 1~2 个身体动作（带 motion 字段的项）——一句里塞得下两个就连续安排两个，节奏不合适就只做 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
-- 同一 actions 可安排说话者连续的语义手势、表情转折，以及听者的表情和动作反应。相邻 at 间隔 ≥0.3。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
-- **动作要有语义、精美流畅**：动作要贴说话内容和情节（说到某物指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类），动作之间衔接顺滑。禁止与台词无关的乱动，不机关枪式换动作、不每句重播同一动作。
+- **时序表演写入 Talk.data.actions**：[{"at":0.2,"modelId":角色ID,"motion":"完整动作名"},{"at":0.65,"modelId":在场听者ID,"facial":"完整表情名"}]。at 为 Talk 实际时长的 0..1 比例，不是秒；按时间排列，**每句台词都必须写 actions**：说话的人每句 2~3 个身体动作（带 motion 字段的项），身体动作尽量贯穿整句连续安排——时间富余就做满 3 个，节奏紧凑就 2 个，短促台词才降到 1 个；表情另外再加 1~2 个、不计入这个数；不说话的人也可以做表情和动作（至多 1 个），每句合计最多 6 项，每项至少 motion/facial 之一。
+- 同一 actions 可安排说话者连续的语义手势、表情转折，以及听者的表情和动作反应。相邻 at 间隔 ≥0.25。只换表情时不必填 motion。听者没有语音，不伪造嘴型或加假台词；不要在 Talk 后插 Motion(wait:false) 冒充说话期间的反应。
+- **动作要有语义、精美流畅**：动作要贴说话内容和情节（说到某物指一指、被戳中时惊讶、安心时松口气），角色跟着台词演；选幅度小而自然的动作（点头、歪头、小手势、轻摆），**禁止幅度过大的动作**（大挥臂、夸张甩头、大幅度摇晃一类）。动作之间衔接顺滑，跟着说话节奏从头到尾连续变化，不要都挤在句首或句尾，也不要说到后半句就僵住；相邻两句之间的姿势自然过渡，不要每句都摆回同一个起手式。禁止与台词无关的乱动，不机关枪式换动作、不每句重播同一动作。
 - 旧 motion/facial 可选，作 at=0 的起始姿态兜底；不要与 actions 重复。句间静默续演才用 Motion.data.actions（wait:true，duration 秒数 >0 且 <=120，默认 2），不能替代 Talk 内听者反应。
 - 只使用对应角色清单里明确列出的完整名称；前缀 * 是分组，不是动作名，不要猜编号。
 - 可用动作：{motion_list}
@@ -586,7 +586,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 ## 输出要求
 1. 只输出合法 JSON，无额外文字；仅含 models、images、snippets
 2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
-3. speaker 与 modelId 必须来自对照表；**每句 Talk 都要写 actions**（说话的人 1~2 个身体动作、表情另加，不说话的人 0~1 个；动作幅度小而自然，禁止大动作），按语义连续安排变化
+3. speaker 与 modelId 必须来自对照表；**每句 Talk 都要写 actions**（说话的人 2~3 个身体动作、表情另加，不说话的人 0~1 个；动作幅度小而自然，禁止大动作），按语义连续安排变化
 4. models=[{"id":<所选角色modelId>,"model":"<对照表中的model路径>","normal_scale":2.1,"small_scale":1.8,"anchor":0.5}]（多角色按登场顺序排列）
 5. images=[{"id":1,"image":"<从可用背景清单按氛围选择的 file 名>"}]
 6. delay 用 0、0.05、0.1、0.15、0.2；换气的 Talk 之间 delay 取 0.1~0.2
@@ -1189,7 +1189,7 @@ class MySekaiStorytellerPlugin(Star):
 
     @staticmethod
     def _build_acting_example(view) -> str:
-        """生成与当前目录 ID/资源一致的最小双人/单人示例，避免 prompt 写死 modelId。"""
+        """生成与当前目录 ID/资源一致的双人/单人示例：说话者 2 个连续身体动作+表情、听者反应。"""
         models = view.models[:2] or [view.default_model()]
         ids = [m.get("id") for m in models]
         entries = [
@@ -1208,8 +1208,19 @@ class MySekaiStorytellerPlugin(Star):
             values = m.get("motions" if field == "motion" else "facials") or []
             fallback = view.default_motion(model_id) if field == "motion" else view.default_facial(model_id)
             return {"at": at, "modelId": model_id, field: values[0] if values else fallback}
+
+        def body_motion(model_id, at, index):
+            """示例里说话者的第 index 个不同非站姿身体动作；清单凑不齐就省略该项。"""
+            m = view.model_by_id(model_id) or view.default_model()
+            names = list(dict.fromkeys(n for n in (m.get("motions") or [])
+                                       if "default" not in n.lower() and "stand" not in n.lower()))
+            return {"at": at, "modelId": model_id, "motion": names[index]} if index < len(names) else None
+
         if len(ids) == 1:
-            talk_actions = [action(ids[0], 0.2, "motion"), action(ids[0], 0.6, "facial")]
+            speaker = ids[0]
+            talk_actions = [item for item in (body_motion(speaker, 0.15, 0),
+                                              body_motion(speaker, 0.5, 1),
+                                              action(speaker, 0.8, "facial")) if item]
             appears = [{"type": "LayoutAppear", "wait": True, "delay": 0,
                         "data": {"modelId": ids[0], "from": {"side": "Right", "offset": 100},
                                  "to": {"side": "Center", "offset": 0},
@@ -1224,7 +1235,10 @@ class MySekaiStorytellerPlugin(Star):
                                          "to": {"side": side, "offset": 0},
                                          "motion": stage_motion(model_id), "facial": view.default_facial(model_id),
                                          "facialFirst": True, "moveSpeed": "Normal"}})
-            talk_actions = [action(first, 0.2, "motion"), action(first, 0.5, "facial"), action(second, 0.8, "facial")]
+            talk_actions = [item for item in (body_motion(first, 0.15, 0),
+                                              body_motion(first, 0.45, 1),
+                                              action(first, 0.7, "facial"),
+                                              action(second, 0.85, "facial")) if item]
         snippets = [{"type": "ChangeLayoutMode", "wait": False, "delay": 0, "data": {"mode": "Normal"}},
                     *appears,
                     {"type": "Talk", "wait": False, "delay": 0,
@@ -1499,7 +1513,7 @@ class MySekaiStorytellerPlugin(Star):
     def _normalize_scene(self, story_data: dict) -> None:
         """插件的舞台约束；非法换人交给原有 LLM 重试，不删台词、不代选退场者。
 
-        单句表演配额（说话者 ≤2、听者 ≤1、同角色间隔 <0.3）在 _validate_actions 硬执行；
+        单句表演配额（说话者 ≤5、听者 ≤1、同角色间隔 <0.25）在 _validate_actions 硬执行；
         表演密度交给提示词把握，这里不再做整场预算。
         """
         visible: dict[int, dict] = {}
