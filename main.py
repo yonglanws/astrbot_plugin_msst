@@ -2015,28 +2015,6 @@ class MySekaiStorytellerPlugin(Star):
                 "message": "视频导出失败，请稍后重试"
             }
 
-    def _calculate_wait_time(self, position: int, task_type: str = "chat") -> tuple[int, int]:
-        """
-        计算等待时间
-
-        Args:
-            position: 队列位置
-            task_type: 任务类型，"chat" 或 "story"
-
-        Returns:
-            (est_time_min, est_time_max) 分钟
-        """
-        if task_type == "chat":
-            # 对话模式：每个任务约 1-2 分钟
-            est_min = max(1, (position+1) * 1)
-            est_max = max(2, (position+1) * 2)
-        else:
-            # 剧本模式：每个任务约 2-3 分钟
-            est_min = max(1, (position+1) * 2)
-            est_max = max(3, (position+1) * 3)
-        
-        return est_min, est_max
-
     @staticmethod
     def _user_error(raw) -> str:
         """把内部异常转成用户可读的短提示，避免把堆栈或内部路径发到群里。"""
@@ -2059,15 +2037,6 @@ class MySekaiStorytellerPlugin(Star):
         if len(text) > 80 or "traceback" in lower or "/" in text or "\\" in text:
             return "视频生成失败，请稍后重试"
         return f"视频生成失败：{text}"
-
-    def _format_queue_message(self, position: int, est_min: int, est_max: int) -> str:
-        """格式化排队提示信息"""
-        return (
-            f"使用此功能的人太多了呢..已加入队列\n"
-            f"当前位置: 第 {position+1} 位\n"
-            f"预计等待: {est_min}-{est_max} 分钟\n"
-            f"前面还有 {position} 个任务正在排队"
-        )
 
     async def _ensure_queue_processor_started(self):
         """确保队列处理器和清理任务已启动"""
@@ -2498,10 +2467,7 @@ class MySekaiStorytellerPlugin(Star):
             return 0
 
     def _initial_reply(self, position: int, wait_kind: str) -> str:
-        """命令即时回复：与剧本生成前流水线一致的两段式文案。"""
-        if position > 0:
-            est_min, est_max = self._calculate_wait_time(position, wait_kind)
-            return self._format_queue_message(position, est_min, est_max)
+        """命令即时回复：只提示生成中，不报排队位次与预计等待。"""
         return "视频生成中，生成时间较久，请耐心等待...."
 
     async def _enqueue_export_and_monitor(self, event, event_context: dict, user_id: str,
@@ -2524,12 +2490,6 @@ class MySekaiStorytellerPlugin(Star):
         except QueueFullError:
             await self._send_safe_message(event, "剧本已生成，但渲染队列已满，请稍后再试", event_context)
             return
-
-        queue_status = await self.export_queue.get_task_status(task_id)
-        if queue_status and queue_status.get("position") is not None and queue_status["position"] > reported_position:
-            position = queue_status["position"]
-            est_min, est_max = self._calculate_wait_time(position, wait_kind)
-            await self._send_safe_message(event, self._format_queue_message(position, est_min, est_max), event_context)
 
         await self._monitor_and_send_video(task_id, event, event_context)
 
