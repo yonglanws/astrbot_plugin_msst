@@ -36,6 +36,7 @@ FALLBACK_CATALOG: dict = {
     ],
     "voices": [],
     "bgm": [],
+    "bgmDetails": [],
 }
 
 
@@ -134,6 +135,12 @@ class CatalogView:
             return details
         return [{"file": name, "name": name, "description": ""} for name in (self.data.get("images") or [])]
 
+    def bgm_details(self) -> list[dict]:
+        details = [d for d in (self.data.get("bgmDetails") or []) if d.get("file")]
+        if details:
+            return details
+        return [{"file": name, "name": name, "description": ""} for name in (self.data.get("bgm") or [])]
+
     def default_image(self) -> str:
         details = self.image_details()
         if details:
@@ -202,6 +209,25 @@ class CatalogView:
         details = self.image_details()
         if not details:
             return "（目录暂未提供背景）"
+        lines = []
+        for d in details:
+            name = d.get("name") or d["file"]
+            desc = (d.get("description") or "").strip()
+            if desc:
+                lines.append(f"- {d['file']}（{name}）：{desc}")
+            else:
+                lines.append(f"- {d['file']}（{name}）")
+        return "\n".join(lines)
+
+    def bgm_list(self) -> str:
+        """BGM 提示词块：列出局点的带描述清单。
+
+        剧本 JSON 不支持单条 story 切换 BGM，AI 通过描述了解可选曲目；
+        全局默认 BGM 由宿主 audio/bgm/bgm.yaml 的 path 决定。
+        """
+        details = self.bgm_details()
+        if not details:
+            return "（目录暂未提供 BGM）"
         lines = []
         for d in details:
             name = d.get("name") or d["file"]

@@ -500,6 +500,11 @@ ChangeLayoutMode → BlackOut → ChangeBackgroundImage → BlackIn → 每个�
 
 根据场景从上方清单选最贴合的背景；需要换场景时 images 可列多张，snippets 里用对应 imageId。必须使用清单中的 file 名。
 
+## 全局背景音乐（当前生效的默认 BGM，不在 story JSON 中切换）
+{bgm_list}
+
+只作剧情氛围参考：清单之外还有全局默认，两者共同决定成片最终混音；根据故事氛围可知还有哪些曲目可让管理员切。
+
 ## 输出要求
 1. 只输出合法 JSON，无 markdown、无解释；仅含 models、images、snippets
 2. 开场与退场序列完整；LayoutAppear 从同侧画外滑入、LayoutClear 向同侧画外滑出（wait:true、moveSpeed="Normal"，入场/退场动作禁用 default 站姿）；任意时刻最多两人在场
@@ -550,6 +555,11 @@ Talk.modelId 必须与 speaker 对应：{id_mapping}
 {image_list}
 
 根据「用户说」的内容从上方清单选最贴合的一张；必须使用清单中的 file 名。
+
+## 全局背景音乐（当前生效的默认 BGM，不在 story JSON 中切换）
+{bgm_list}
+
+只作剧情氛围参考：清单之外还有全局默认，两者共同决定成片最终混音；根据故事氛围可知还有哪些曲目可让管理员切。
 
 ## JSON 结构
 每个 Talk 必须包含 content（中文）和 ttsText（日文翻译）。
@@ -1358,6 +1368,7 @@ class MySekaiStorytellerPlugin(Star):
             "{motion_list}": view.motion_list(),
             "{facial_list}": view.facial_list(),
             "{image_list}": view.image_list(),
+            "{bgm_list}": view.bgm_list(),
             "{scene}": scene,
         })
 
@@ -1393,6 +1404,7 @@ class MySekaiStorytellerPlugin(Star):
             "{motion_list}": view.motion_list(),
             "{facial_list}": view.facial_list(),
             "{image_list}": view.image_list(),
+            "{bgm_list}": view.bgm_list(),
             "{chat_history}": chat_history_text,
             "{scene}": scene,
         })
@@ -2899,7 +2911,7 @@ class MySekaiStorytellerPlugin(Star):
                 f"  {view.short_name(m)}(id={m['id']}) — 动作 {len(m.get('motions') or [])} 个，表情 {len(m.get('facials') or [])} 个"
             )
         image_details = data.get("imageDetails") or []
-        bgm = data.get("bgm") or []
+        bgm_details = data.get("bgmDetails") or []
         if image_details:
             lines.append(f"🖼️ 可用背景（{len(image_details)}，见 resources/images/images.yaml）：")
             for d in image_details:
@@ -2910,8 +2922,18 @@ class MySekaiStorytellerPlugin(Star):
         else:
             images = data.get("images") or []
             lines.append(f"🖼️ 可用背景（{len(images)}）：{', '.join(images) or '无'}")
-        lines.append(f"🎵 可用 BGM（{len(bgm)}）：{', '.join(bgm) or '无'}（在宿主 config.yaml 的 bgm 节启用）")
-        lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记；新增背景：放入 resources/images/ 并在 images.yaml 写描述，约 30 秒后自动感知")
+        if bgm_details:
+            lines.append(f"🎵 可用 BGM（{len(bgm_details)}，见 resources/audio/bgm/bgm.yaml）：")
+            for d in bgm_details:
+                name = d.get("name") or d.get("file")
+                desc = (d.get("description") or "").strip()
+                suffix = f" — {desc}" if desc else ""
+                lines.append(f"  {d.get('file')}（{name}）{suffix}")
+            lines.append("  · 全局默认 BGM 由 bgm.yaml 的 path 决定，本列表就是导出的背景音乐候选")
+        else:
+            bgm = data.get("bgm") or []
+            lines.append(f"🎵 可用 BGM（{len(bgm)}）：{', '.join(bgm) or '无'}（在宿主 config.yaml 的 bgm 节启用）")
+        lines.append("💡 新增模型：放入宿主 resources/models/ 并在 models.yaml 登记；新增背景：放入 resources/images/ 并在 images.yaml 写描述；新增 BGM：放入 resources/audio/bgm/ 并在 bgm.yaml 写描述，约 30 秒后自动感知")
         yield event.plain_result("\n".join(lines))
 
     @mssadmin.command("setapi", alias={'设置api', '设置API', '更新api'})
