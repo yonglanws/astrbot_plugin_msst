@@ -988,6 +988,9 @@ class MySekaiStorytellerPlugin(Star):
         if isinstance(e, UnicodeDecodeError):
             return (f"响应内容无法按 UTF-8 解码（{e}）——常见于中转网关返回了压缩响应体"
                     "或非 UTF-8 错误页，请检查模型服务商/中转配置")
+        if isinstance(e, json.JSONDecodeError):
+            return (f"响应不是有效 JSON（{e}）——常见于该模型/中转网关临时返回空响应体"
+                    "或错误页，请稍后再试；若反复出现请检查该模型通道")
         name = type(e).__name__
         text = str(e)
         lowered = text.lower()
@@ -1010,6 +1013,12 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"{label}: LLM 提供商未配置")
             return None
 
+        # 部分模型/中转会间歇性返回空响应体或错误页，日志带上模型标识便于定位是哪一家
+        provider_label = str(
+            getattr(provider, "model_name", None)
+            or getattr(provider, "model", None)
+            or type(provider).__name__
+        )
         last_reason = "LLM 响应为空"
         for attempt in range(len(self.LLM_RETRY_DELAYS) + 1):
             if attempt:
@@ -1024,14 +1033,16 @@ class MySekaiStorytellerPlugin(Star):
                 )
             except Exception as e:
                 last_reason = self._describe_llm_error(e)
-                logger.warning(f"{label}: 调用异常 — {last_reason}", exc_info=True)
+                logger.warning(f"{label}[{provider_label}]: 调用异常 — {last_reason}", exc_info=True)
                 continue
             text = llm_resp.completion_text if llm_resp else None
             if text and text.strip():
                 return text.strip()
             last_reason = "LLM 响应为空"
-            logger.warning(f"{label}: {last_reason}")
-        logger.error(f"{label}失败（重试 {len(self.LLM_RETRY_DELAYS)} 次后放弃）— {last_reason}")
+            logger.warning(f"{label}[{provider_label}]: {last_reason}")
+        logger.error(
+            f"{label}[{provider_label}]失败（重试 {len(self.LLM_RETRY_DELAYS)} 次后放弃）— {last_reason}"
+        )
         return None
 
     async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
@@ -2139,6 +2150,8 @@ class MySekaiStorytellerPlugin(Star):
             return "视频生成超时，请稍后重试"
         if "排队已满" in text or "队列已满" in text:
             return "当前排队已满，请稍后再试"
+        if "不是有效 json" in lower or "jsondecodeerror" in lower:
+            return "模型服务返回了空响应，请稍后再试；若反复出现请联系管理员检查该模型通道"
         if "无法解析" in text or "json" in lower:
             return "剧本生成失败，请换个说法再试一次"
         if "超时" in text or "timeout" in lower:
