@@ -639,6 +639,12 @@ class MySekaiStorytellerPlugin(Star):
         self.export_timeout = config.get("export_timeout", 600)
         self.max_concurrent_exports = config.get("max_concurrent_exports", 2)
         self.script_max_concurrent = config.get("script_max_concurrent", 2)
+        # 剧本阶段（LLM + 校验 + ttsText 翻译）的整体墙钟上限：provider 路径下
+        # tenacity×SDK 的嵌套重试可以把单次生成拖到几十分钟，必须有一个总闸
+        try:
+            self.script_timeout = max(60, int(config.get("script_timeout", 1200)))
+        except (TypeError, ValueError):
+            self.script_timeout = 1200
         self.temp_dir = config.get("temp_dir", "")
         self.callback_api_base = config.get("callback_api_base", "").rstrip("/")
 
@@ -706,6 +712,9 @@ class MySekaiStorytellerPlugin(Star):
         self._history_lock = asyncio.Lock()
         self._stats_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        # 在途剧本流水线登记：terminate 时统一取消，防止 WebUI 重载后旧实例的
+        # 幽灵任务继续调 LLM、继续发视频
+        self._pipeline_tasks: set[asyncio.Task] = set()
 
         self.export_queue = VideoExportQueue(
             max_concurrent=self.max_concurrent_exports,
@@ -1036,6 +1045,10 @@ class MySekaiStorytellerPlugin(Star):
             except Exception as e:
                 last_reason = self._describe_llm_error(e)
                 logger.warning(f"{label}[{provider_label}]: 调用异常 — {last_reason}", exc_info=True)
+                # 超时类错误在核心层已被 tenacity（5 次）+ OpenAI SDK（再 2 次）反复重试过，
+                # 插件级再叠 1s/3s 重试只会成倍放大整条链路的等待，直接放弃本轮
+                if "超时" in last_reason or "timed out" in last_reason.lower():
+                    break
                 continue
             text = llm_resp.completion_text if llm_resp else None
             if text and text.strip():
@@ -1590,11 +1603,24 @@ class MySekaiStorytellerPlugin(Star):
                 if field not in action:
                     continue
                 value = action[field]
-                if not isinstance(value, str) or value not in self._animation_choices(view, model_id, field):
-                    raise ValueError(f"{where}.{field} 必须是该角色资源清单中的完整名称")
-                cleaned[field] = value
+                if isinstance(value, str) and value in self._animation_choices(view, model_id, field):
+                    cleaned[field] = value
+                    continue
+                # 命名类错误不触发整场重试：先按目录纠正（AI 只见过分组样例，
+                # 编造近名是常态），修不了只丢这一项，保住其余表演与全部台词
+                fixed = view.canonical_animation(model_id, field, value)
+                if fixed:
+                    logger.info(f"{where}.{field} '{value}' 不在 {view.name_by_id(model_id)} 清单中，已修正为 '{fixed}'")
+                    cleaned[field] = fixed
+                else:
+                    sample = "、".join(sorted(self._animation_choices(view, model_id, field))[:5])
+                    logger.warning(
+                        f"{where}.{field} '{value}' 无法对应 {view.name_by_id(model_id)} 的资源，已丢弃"
+                        f"（该角色可用如：{sample}）"
+                    )
             if len(cleaned) == 2:
-                raise ValueError(f"{where} 至少需要一个 motion 或 facial")
+                logger.warning(f"{where} 修正后 motion/facial 均不可用，已移除该处表演")
+                continue
             normalized.append(cleaned)
         normalized.sort(key=lambda action: action["at"])
         speaker_id = data.get("modelId")
@@ -1850,13 +1876,23 @@ class MySekaiStorytellerPlugin(Star):
                 # 说话并发动作/表情：非法值回退该角色默认；空串 = 保持当前姿态不播
                 talk_motion = self._clean_path(self._to_str(data.get("motion"), ""))
                 if talk_motion and talk_motion not in view.valid_motions(data["modelId"]):
-                    logger.warning(f"Talk motion '{talk_motion}' not available for {view.name_by_id(data['modelId'])}, falling back to {view.default_motion(data['modelId'])}")
-                    talk_motion = view.default_motion(data["modelId"])
+                    fixed = view.canonical_animation(data["modelId"], "motion", talk_motion)
+                    if fixed:
+                        logger.info(f"Talk motion '{talk_motion}' 已修正为 '{fixed}'")
+                        talk_motion = fixed
+                    else:
+                        logger.warning(f"Talk motion '{talk_motion}' not available for {view.name_by_id(data['modelId'])}, falling back to {view.default_motion(data['modelId'])}")
+                        talk_motion = view.default_motion(data["modelId"])
                 data["motion"] = talk_motion
                 talk_facial = self._clean_path(self._to_str(data.get("facial"), ""))
                 if talk_facial and talk_facial not in view.valid_facials(data["modelId"]):
-                    logger.warning(f"Talk facial '{talk_facial}' not available for {view.name_by_id(data['modelId'])}, falling back to {view.default_facial(data['modelId'])}")
-                    talk_facial = view.default_facial(data["modelId"])
+                    fixed = view.canonical_animation(data["modelId"], "facial", talk_facial)
+                    if fixed:
+                        logger.info(f"Talk facial '{talk_facial}' 已修正为 '{fixed}'")
+                        talk_facial = fixed
+                    else:
+                        logger.warning(f"Talk facial '{talk_facial}' not available for {view.name_by_id(data['modelId'])}, falling back to {view.default_facial(data['modelId'])}")
+                        talk_facial = view.default_facial(data["modelId"])
                 data["facial"] = talk_facial
                 snippet["data"] = data
 
@@ -1868,6 +1904,11 @@ class MySekaiStorytellerPlugin(Star):
                 data["facial"] = self._to_str(data.get("facial"), view.default_facial(model_id))
                 for field in ("motion", "facial"):
                     if data[field] and data[field] not in self._animation_choices(view, model_id, field):
+                        fixed = view.canonical_animation(model_id, field, data[field])
+                        if fixed:
+                            logger.info(f"LayoutAppear {field} '{data[field]}' 已修正为 '{fixed}'")
+                            data[field] = fixed
+                            continue
                         logger.warning(f"LayoutAppear {field} '{data[field]}' not available for {view.name_by_id(model_id)}, falling back")
                         data[field] = "" if field == "motion" else view.default_facial(model_id)
                 # 入场必须有动作，且禁止 default 站姿滑入（站姿滑入等于站桩）
@@ -1906,8 +1947,13 @@ class MySekaiStorytellerPlugin(Star):
                 # 退场必须有动作（禁止无动画消失），且禁止 default 站姿退场
                 clear_motion = self._clean_path(self._to_str(data.get("motion"), ""))
                 if clear_motion and clear_motion not in view.valid_motions(model_id):
-                    logger.warning(f"LayoutClear motion '{clear_motion}' not available for {view.name_by_id(model_id)}, falling back")
-                    clear_motion = ""
+                    fixed = view.canonical_animation(model_id, "motion", clear_motion)
+                    if fixed:
+                        logger.info(f"LayoutClear motion '{clear_motion}' 已修正为 '{fixed}'")
+                        clear_motion = fixed
+                    else:
+                        logger.warning(f"LayoutClear motion '{clear_motion}' not available for {view.name_by_id(model_id)}, falling back")
+                        clear_motion = ""
                 if not clear_motion or self._is_standing_motion(clear_motion):
                     clear_motion = self._pick_stage_motion(view, model_id)
                 data["motion"] = clear_motion
@@ -1915,8 +1961,13 @@ class MySekaiStorytellerPlugin(Star):
                 if not clear_facial:
                     clear_facial = view.default_facial(model_id)
                 elif clear_facial not in view.valid_facials(model_id):
-                    logger.warning(f"LayoutClear facial '{clear_facial}' not available for {view.name_by_id(model_id)}, falling back to {view.default_facial(model_id)}")
-                    clear_facial = view.default_facial(model_id)
+                    fixed = view.canonical_animation(model_id, "facial", clear_facial)
+                    if fixed:
+                        logger.info(f"LayoutClear facial '{clear_facial}' 已修正为 '{fixed}'")
+                        clear_facial = fixed
+                    else:
+                        logger.warning(f"LayoutClear facial '{clear_facial}' not available for {view.name_by_id(model_id)}, falling back to {view.default_facial(model_id)}")
+                        clear_facial = view.default_facial(model_id)
                 data["facial"] = clear_facial
                 snippet["data"] = data
 
@@ -1933,11 +1984,21 @@ class MySekaiStorytellerPlugin(Star):
                 motion = self._to_str(data.get("motion"), "" if has_actions else view.default_motion(model_id))
                 facial = self._to_str(data.get("facial"), "" if has_actions else view.default_facial(model_id))
                 if motion and motion not in self._animation_choices(view, model_id, "motion"):
-                    logger.warning(f"Motion '{motion}' not available for {view.name_by_id(model_id)}, falling back to {view.default_motion(model_id)}")
-                    motion = view.default_motion(model_id)
+                    fixed = view.canonical_animation(model_id, "motion", motion)
+                    if fixed:
+                        logger.info(f"Motion '{motion}' 已修正为 '{fixed}'")
+                        motion = fixed
+                    else:
+                        logger.warning(f"Motion '{motion}' not available for {view.name_by_id(model_id)}, falling back to {view.default_motion(model_id)}")
+                        motion = view.default_motion(model_id)
                 if facial and facial not in self._animation_choices(view, model_id, "facial"):
-                    logger.warning(f"Facial '{facial}' not available for {view.name_by_id(model_id)}, falling back to {view.default_facial(model_id)}")
-                    facial = view.default_facial(model_id)
+                    fixed = view.canonical_animation(model_id, "facial", facial)
+                    if fixed:
+                        logger.info(f"Facial '{facial}' 已修正为 '{fixed}'")
+                        facial = fixed
+                    else:
+                        logger.warning(f"Facial '{facial}' not available for {view.name_by_id(model_id)}, falling back to {view.default_facial(model_id)}")
+                        facial = view.default_facial(model_id)
                 data["motion"] = motion
                 data["facial"] = facial
                 data["facialFirst"] = self._to_bool(data.get("facialFirst"), True)
@@ -2162,6 +2223,8 @@ class MySekaiStorytellerPlugin(Star):
             return "模型服务多次重试后仍无有效响应，请稍后再试；若反复出现请联系管理员检查该模型通道"
         if "无法解析" in text or "json" in lower:
             return "剧本生成失败，请换个说法再试一次"
+        if "剧本生成超时" in text:
+            return "剧本生成超时，请稍后再试"
         if "超时" in text or "timeout" in lower:
             return "视频生成超时，请稍后重试"
         if "无法连接" in text or "connect" in lower:
@@ -2175,6 +2238,12 @@ class MySekaiStorytellerPlugin(Star):
         if len(text) > 80 or "traceback" in lower or "/" in text or "\\" in text:
             return "视频生成失败，请稍后重试"
         return f"视频生成失败：{text}"
+
+    def _spawn_pipeline(self, coro) -> None:
+        """登记后台流水线任务；terminate() 会取消在途任务，避免重载后幽灵流水线继续运行。"""
+        task = asyncio.create_task(coro)
+        self._pipeline_tasks.add(task)
+        task.add_done_callback(self._pipeline_tasks.discard)
 
     async def _ensure_queue_processor_started(self):
         """确保队列处理器和清理任务已启动"""
@@ -2219,7 +2288,7 @@ class MySekaiStorytellerPlugin(Star):
         event_context = self._extract_event_context(event)
         backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "chat"))
-        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, event_context, backlog))
 
     @filter.command("剧本生成", alias={'剧本对话', '故事生成', 'story', '生成剧本', '生成故事'})
     async def mss_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2246,7 +2315,7 @@ class MySekaiStorytellerPlugin(Star):
         event_context = self._extract_event_context(event)
         backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "story"))
-        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, event_context, backlog))
 
     @filter.command("测试视频对话", alias={'测试视频生成', '测试视频聊天'})
     async def mss_test_chat_mode(self, event: AstrMessageEvent, message: str):
@@ -2268,7 +2337,7 @@ class MySekaiStorytellerPlugin(Star):
         event_context = self._extract_event_context(event)
         backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "chat"))
-        asyncio.create_task(self._pipeline_chat(event, message, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, event_context, backlog))
 
     @filter.command("测试剧本生成", alias={'测试故事生成', '测试story', '测试生成剧本'})
     async def mss_test_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2290,7 +2359,7 @@ class MySekaiStorytellerPlugin(Star):
         event_context = self._extract_event_context(event)
         backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "story"))
-        asyncio.create_task(self._pipeline_story(event, scene, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, event_context, backlog))
 
     def _extract_event_context(self, event: AstrMessageEvent) -> dict:
         """提取事件上下文信息，用于后续消息发送"""
@@ -2520,20 +2589,27 @@ class MySekaiStorytellerPlugin(Star):
     async def _generate_chat_story(self, message: str, user_id: str) -> tuple:
         """LLM 生成对话剧本（含校验重试），返回 (story_data, 首个说话角色)。
         只做剧本阶段，不涉及视频导出——由调用方决定何时入导出队列。"""
-        system_prompt, user_prompt = await self._build_chat_prompt(message, user_id)
+        system_prompt, base_prompt = await self._build_chat_prompt(message, user_id)
         max_retries = 2
-        story_data = None
+        validated: Optional[dict] = None  # 只有校验通过的剧本才算数，失败轮的坏剧本不得流出
         last_failure = "LLM 未返回内容"
+        user_prompt = base_prompt
 
         for attempt in range(max_retries + 1):
+            # 请求发出即打日志：慢模型一次 4-5 分钟，期间不能再是"完全没影"的静默窗
+            logger.info(f"剧本生成第 {attempt + 1}/{max_retries + 1} 轮：请求已发出，等待模型返回…")
+            started = time.monotonic()
             llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            elapsed = time.monotonic() - started
             if not llm_response:
                 last_failure = "LLM 调用失败"
+                logger.warning(f"剧本生成第 {attempt + 1} 轮无有效返回（{elapsed:.0f} 秒）")
                 if attempt < max_retries:
                     logger.warning(f"LLM 未返回内容，重试 ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(1.0)
                 continue
 
+            logger.info(f"剧本生成第 {attempt + 1} 轮已返回（{elapsed:.0f} 秒，{len(llm_response)} 字）")
             story_data = self._extract_json_from_response(llm_response)
             if not story_data:
                 if attempt < max_retries:
@@ -2542,16 +2618,23 @@ class MySekaiStorytellerPlugin(Star):
                 raise ValueError("AI 返回的内容无法解析为 JSON")
 
             try:
-                story_data = self._validate_and_fix_story(story_data)
+                validated = self._validate_and_fix_story(story_data)
                 break
             except ValueError as e:
+                validated = None
                 if attempt < max_retries:
                     logger.warning(f"验证失败，重试 ({attempt+1}/{max_retries}): {e}")
-                    user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
+                    # 修复轮 = 固定原始要求 + 最近一次的问题剧本 + 具体错误，
+                    # 让模型定向修改而不是盲写全场；不叠加历史轮，避免提示词递归膨胀
+                    user_prompt = (
+                        f"上次输出的剧本存在以下问题：\n{e}\n"
+                        f"请只修正该问题、其余内容保持原样，重新输出完整 JSON。上次输出：\n{llm_response}\n\n"
+                        f"原始要求：\n\n{base_prompt}"
+                    )
                     continue
                 raise e
 
-        if not story_data:
+        if validated is None:
             # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
             # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
             detail = getattr(self, "_llm_failure_reason", None)
@@ -2559,7 +2642,7 @@ class MySekaiStorytellerPlugin(Star):
                 f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
             )
 
-        story_data = await self._ensure_tts_text(story_data)
+        story_data = await self._ensure_tts_text(validated)
 
         # 添加聊天历史（role 记录本次实际说话的角色）
         first_content = ""
@@ -2574,20 +2657,27 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _generate_story(self, scene: str) -> dict:
         """LLM 生成剧本（含校验重试），只做剧本阶段。"""
-        system_prompt, user_prompt = await self._build_prompt(scene)
+        system_prompt, base_prompt = await self._build_prompt(scene)
         max_retries = 2
-        story_data = None
+        validated: Optional[dict] = None  # 只有校验通过的剧本才算数，失败轮的坏剧本不得流出
         last_failure = "LLM 未返回内容"
+        user_prompt = base_prompt
 
         for attempt in range(max_retries + 1):
+            # 请求发出即打日志：慢模型一次 4-5 分钟，期间不能再是"完全没影"的静默窗
+            logger.info(f"剧本生成第 {attempt + 1}/{max_retries + 1} 轮：请求已发出，等待模型返回…")
+            started = time.monotonic()
             llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            elapsed = time.monotonic() - started
             if not llm_response:
                 last_failure = "LLM 调用失败"
+                logger.warning(f"剧本生成第 {attempt + 1} 轮无有效返回（{elapsed:.0f} 秒）")
                 if attempt < max_retries:
                     logger.warning(f"LLM 未返回内容，重试 ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(1.0)
                 continue
 
+            logger.info(f"剧本生成第 {attempt + 1} 轮已返回（{elapsed:.0f} 秒，{len(llm_response)} 字）")
             story_data = self._extract_json_from_response(llm_response)
             if not story_data:
                 if attempt < max_retries:
@@ -2596,16 +2686,23 @@ class MySekaiStorytellerPlugin(Star):
                 raise ValueError("AI 返回的内容无法解析为 JSON")
 
             try:
-                story_data = self._validate_and_fix_story(story_data)
+                validated = self._validate_and_fix_story(story_data)
                 break
             except ValueError as e:
+                validated = None
                 if attempt < max_retries:
                     logger.warning(f"验证失败，AI自动修正重试 ({attempt+1}/{max_retries}): {e}")
-                    user_prompt = f"上次生成的剧本有问题: {e}\n请修正后重新输出完整JSON。原始要求：\n\n{user_prompt}"
+                    # 修复轮 = 固定原始要求 + 最近一次的问题剧本 + 具体错误，
+                    # 让模型定向修改而不是盲写全场；不叠加历史轮，避免提示词递归膨胀
+                    user_prompt = (
+                        f"上次输出的剧本存在以下问题：\n{e}\n"
+                        f"请只修正该问题、其余内容保持原样，重新输出完整 JSON。上次输出：\n{llm_response}\n\n"
+                        f"原始要求：\n\n{base_prompt}"
+                    )
                     continue
                 raise e
 
-        if not story_data:
+        if validated is None:
             # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
             # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
             detail = getattr(self, "_llm_failure_reason", None)
@@ -2613,7 +2710,7 @@ class MySekaiStorytellerPlugin(Star):
                 f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
             )
 
-        return await self._ensure_tts_text(story_data)
+        return await self._ensure_tts_text(validated)
 
     async def _queue_backlog(self) -> int:
         """命令到达时导出队列的积压估算（等待中 + 正在渲染）。"""
@@ -2654,15 +2751,23 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _pipeline_chat(self, event, message: str, user_id: str, event_context: dict = None,
                              reported_position: int = 0):
-        """对话模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
+        """对话模式流水线：剧本（受 _script_semaphore 并发 + 墙钟超时）→ 导出队列（串行渲染）"""
         try:
             async with self._script_semaphore:
-                story_data, first_speaker = await self._generate_chat_story(message, user_id)
+                story_data, first_speaker = await asyncio.wait_for(
+                    self._generate_chat_story(message, user_id),
+                    timeout=self.script_timeout,
+                )
             await self._enqueue_export_and_monitor(
                 event, event_context, user_id=user_id,
                 story_data=story_data,
                 description=f"{first_speaker}的回复" if first_speaker else "角色回复",
                 priority=1, wait_kind="chat", reported_position=reported_position
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"剧本生成超时（{self.script_timeout} 秒），已中止: user={user_id}")
+            await self._send_safe_message(
+                event, f"剧本生成超时（{self.script_timeout} 秒），请稍后再试", event_context
             )
         except Exception as e:
             logger.error(f"对话剧本生成失败: {e}")
@@ -2670,15 +2775,23 @@ class MySekaiStorytellerPlugin(Star):
 
     async def _pipeline_story(self, event, scene: str, sender_id: str, event_context: dict = None,
                               reported_position: int = 0):
-        """剧本模式流水线：剧本（受 _script_semaphore 并发）→ 导出队列（串行渲染）"""
+        """剧本模式流水线：剧本（受 _script_semaphore 并发 + 墙钟超时）→ 导出队列（串行渲染）"""
         try:
             async with self._script_semaphore:
-                story_data = await self._generate_story(scene)
+                story_data = await asyncio.wait_for(
+                    self._generate_story(scene),
+                    timeout=self.script_timeout,
+                )
             await self._enqueue_export_and_monitor(
                 event, event_context, user_id=sender_id,
                 story_data=story_data,
                 description=scene,
                 priority=2, wait_kind="story", reported_position=reported_position
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"剧本生成超时（{self.script_timeout} 秒），已中止: user={sender_id}")
+            await self._send_safe_message(
+                event, f"剧本生成超时（{self.script_timeout} 秒），请稍后再试", event_context
             )
         except Exception as e:
             logger.error(f"剧本生成失败: {e}")
@@ -2985,6 +3098,15 @@ class MySekaiStorytellerPlugin(Star):
     async def terminate(self):
         """AstrBot 插件终止时调用，用于优雅保存数据"""
         logger.info("MySekaiStoryteller 插件正在关闭，保存持久化数据...")
+
+        # 先取消在途剧本流水线：实测旧实例的流水线会在 terminate 完成后继续
+        # 调 LLM、继续发送视频（WebUI 重载时的"幽灵生成"），必须显式中断
+        pending = [t for t in self._pipeline_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.info(f"已取消 {len(pending)} 条在途剧本流水线")
 
         # 保存所有持久化数据
         self._save_stats()

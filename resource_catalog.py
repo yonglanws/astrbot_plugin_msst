@@ -5,12 +5,16 @@
 """
 
 import asyncio
+import re
 import time
 
 import httpx
 
 CATALOG_TTL_SECONDS = 300
 FETCH_TIMEOUT_SECONDS = 10.0
+# 角色动作/表情不超过该数量时，提示词给出完整清单；过多时回退前缀分组样例，
+# 避免清单撑爆提示词（实测大角色可达 200+ 动作）
+SUMMARIZE_FULL_LIMIT = 60
 
 # 目录不可用时的最小兜底（保证插件可降级工作：prompt 有锚点、校验只放行默认值）
 FALLBACK_CATALOG: dict = {
@@ -53,9 +57,12 @@ def _facial_prefix(facial_name: str) -> str:
 
 
 def _summarize_names(names: list, prefix_fn) -> str:
-    """把长名单压缩为"前缀（种类数）: 样例1、样例2"的形式，控制 prompt 长度。"""
+    """压缩长名单：少量时直接给完整名（AI 只能输出清单里出现过的完整名，
+    只给样例必然编造）；超过阈值才回退"前缀（种类数）: 样例"的分组形式控制长度。"""
     if not names:
         return "（目录暂未提供）"
+    if len(names) <= SUMMARIZE_FULL_LIMIT:
+        return "，".join(sorted(names))
     groups: dict[str, list] = {}
     for name in names:
         groups.setdefault(prefix_fn(name), []).append(name)
@@ -181,6 +188,40 @@ class CatalogView:
     def default_facial(self, model_id) -> str:
         m = self.model_by_id(model_id)
         return (m.get("defaultFacial") if m else "") or "face_smile_01"
+
+    def canonical_animation(self, model_id, field: str, value) -> str | None:
+        """把 AI 写的动作/表情名尽量修正成目录中的完整名；修不了返回 None。
+
+        匹配顺序：精确 → 忽略大小写/空白 → 忽略尾部数字（w-happy-glad02 → w-happy-glad01，
+        同名多编号时视为歧义不猜）→ 唯一前缀（AI 只写到 w-happy 且该前缀仅对应一个动作）。
+        校验层据此把"必须是完整名称"的硬失败变成自动修复。
+        """
+        if not isinstance(value, str):
+            return None
+        v = value.strip()
+        if not v:
+            return None
+        names = self.valid_motions(model_id) if field == "motion" else self.valid_facials(model_id)
+        if not names:
+            return None
+        if v in names:
+            return v
+        lowered = {n.lower(): n for n in sorted(names)}
+        hit = lowered.get(v.lower())
+        if hit:
+            return hit
+        compact = {n.replace(" ", "").lower(): n for n in sorted(names)}
+        hit = compact.get(v.replace(" ", "").lower())
+        if hit:
+            return hit
+        stem = re.sub(r"\d+$", "", v.lower())
+        stem_hits = [n for n in sorted(names) if re.sub(r"\d+$", "", n.lower()) == stem]
+        if len(stem_hits) == 1:
+            return stem_hits[0]
+        prefix_hits = [n for n in sorted(names) if n.lower().startswith(v.lower())]
+        if len(prefix_hits) == 1:
+            return prefix_hits[0]
+        return None
 
     # ----- prompt 文本块 -----
 
