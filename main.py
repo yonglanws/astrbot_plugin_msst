@@ -1019,6 +1019,8 @@ class MySekaiStorytellerPlugin(Star):
             or getattr(provider, "model", None)
             or type(provider).__name__
         )
+        # 重试耗尽后的失败原因（[模型] + 分类文案）；最终失败时随异常透传给用户
+        self._llm_failure_reason: Optional[str] = None
         last_reason = "LLM 响应为空"
         for attempt in range(len(self.LLM_RETRY_DELAYS) + 1):
             if attempt:
@@ -1043,6 +1045,7 @@ class MySekaiStorytellerPlugin(Star):
         logger.error(
             f"{label}[{provider_label}]失败（重试 {len(self.LLM_RETRY_DELAYS)} 次后放弃）— {last_reason}"
         )
+        self._llm_failure_reason = f"[{provider_label}] {last_reason}"
         return None
 
     async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
@@ -2152,6 +2155,11 @@ class MySekaiStorytellerPlugin(Star):
             return "当前排队已满，请稍后再试"
         if "不是有效 json" in lower or "jsondecodeerror" in lower:
             return "模型服务返回了空响应，请稍后再试；若反复出现请联系管理员检查该模型通道"
+        if text.startswith("LLM 调用失败"):
+            # 剧本/对话生成多次重试仍失败透传的错误：带 [模型] 与归类原因，按原因细分
+            if "utf-8" in lower or "解码" in text or "decode" in lower:
+                return "模型服务返回了异常内容，请稍后再试；若反复出现请联系管理员检查模型中转配置"
+            return "模型服务多次重试后仍无有效响应，请稍后再试；若反复出现请联系管理员检查该模型通道"
         if "无法解析" in text or "json" in lower:
             return "剧本生成失败，请换个说法再试一次"
         if "超时" in text or "timeout" in lower:
@@ -2544,7 +2552,12 @@ class MySekaiStorytellerPlugin(Star):
                 raise e
 
         if not story_data:
-            raise ValueError(f"{last_failure}（已重试 {max_retries} 次，请稍后再试）")
+            # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
+            # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
+            detail = getattr(self, "_llm_failure_reason", None)
+            raise ValueError(
+                f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
+            )
 
         story_data = await self._ensure_tts_text(story_data)
 
@@ -2593,7 +2606,12 @@ class MySekaiStorytellerPlugin(Star):
                 raise e
 
         if not story_data:
-            raise ValueError(f"{last_failure}（已重试 {max_retries} 次，请稍后再试）")
+            # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
+            # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
+            detail = getattr(self, "_llm_failure_reason", None)
+            raise ValueError(
+                f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
+            )
 
         return await self._ensure_tts_text(story_data)
 
