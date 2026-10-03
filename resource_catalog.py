@@ -107,7 +107,9 @@ class ResourceCatalog:
 
             if self._data is None:
                 self._data = FALLBACK_CATALOG
-                self._fetched_at = now
+                # 兜底目录不占用 TTL：fetched_at 保持 0，下次调用立即重试真实目录，
+                # 避免宿主短暂不可用时把"仅瑞希"的兜底清单当真实目录用满 5 分钟
+                self._fetched_at = 0.0
             return self._data
 
     def view(self) -> "CatalogView":
@@ -206,12 +208,19 @@ class CatalogView:
             return None
         if v in names:
             return v
-        lowered = {n.lower(): n for n in sorted(names)}
-        hit = lowered.get(v.lower())
+        # 归一匹配只在唯一命中时采用：清单里若存在同 key 的大小写/空白变体，
+        # 静默选其中一个会猜错，视为歧义不修
+        def _unique_hit(key_fn) -> str | None:
+            counts: dict[str, int] = {}
+            for n in names:
+                counts[key_fn(n)] = counts.get(key_fn(n), 0) + 1
+            hit = {key_fn(n): n for n in sorted(names) if counts[key_fn(n)] == 1}
+            return hit.get(key_fn(v))
+
+        hit = _unique_hit(str.lower)
         if hit:
             return hit
-        compact = {n.replace(" ", "").lower(): n for n in sorted(names)}
-        hit = compact.get(v.replace(" ", "").lower())
+        hit = _unique_hit(lambda n: n.replace(" ", "").lower())
         if hit:
             return hit
         stem = re.sub(r"\d+$", "", v.lower())

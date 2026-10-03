@@ -21,7 +21,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig
 
-from .queue_manager import VideoExportQueue, QueueFullError
+from .queue_manager import VideoExportQueue, QueueFullError, PermanentTaskError
 from .resource_catalog import ResourceCatalog
 from .persona import PersonaRegistry
 
@@ -44,6 +44,9 @@ def _fill_template(template: str, mapping: dict[str, str]) -> str:
 # 台词排版约束（1080p 台词框实测：折行宽约 34 个全角字符、纵向约 4 行，此处留余量）
 TALK_LINE_WIDTH_UNITS = 26.0  # 每行显示宽度上限（全角字=1，半角字=0.5）
 TALK_MAX_LINES = 3            # 单条 Talk 最大行数；超行由 _split_overflow_talks 拆成连续多条，不截断
+# 批量翻译失败后逐条回退的最大条数上限：之后不再逐条请求 LLM（只保留空 ttsText，
+# 由宿主跳过配音），防止长剧本在模型通道故障期打出 3(N+1) 次调用
+TTS_FALLBACK_MAX_ITEMS = 10
 
 
 def _char_width_units(ch: str) -> float:
@@ -636,9 +639,10 @@ class MySekaiStorytellerPlugin(Star):
 
         # 插件配置
         self.mss_api_url = config.get("mss_api_url", "http://127.0.0.1:9881")
+        # 并发下限钳到 1：0 会让剧本/导出永久等待（超时闸在拿到并发名额后才开始计时）
         self.export_timeout = config.get("export_timeout", 600)
-        self.max_concurrent_exports = config.get("max_concurrent_exports", 2)
-        self.script_max_concurrent = config.get("script_max_concurrent", 2)
+        self.max_concurrent_exports = max(1, int(config.get("max_concurrent_exports", 2) or 1))
+        self.script_max_concurrent = max(1, int(config.get("script_max_concurrent", 2) or 1))
         # 剧本阶段（LLM + 校验 + ttsText 翻译）的整体墙钟上限：provider 路径下
         # tenacity×SDK 的嵌套重试可以把单次生成拖到几十分钟，必须有一个总闸
         try:
@@ -708,13 +712,18 @@ class MySekaiStorytellerPlugin(Star):
         self.story_dir.mkdir(parents=True, exist_ok=True)
 
         # 并发控制
-        self.active_exports: set[str] = set()
         self._history_lock = asyncio.Lock()
         self._stats_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         # 在途剧本流水线登记：terminate 时统一取消，防止 WebUI 重载后旧实例的
         # 幽灵任务继续调 LLM、继续发视频
         self._pipeline_tasks: set[asyncio.Task] = set()
+        # 同一会话（unified_msg_origin）的生成互斥锁：同一聊天里多条请求按到达顺序
+        # 串行生成，历史记录才不会乱序；锁按需创建，随会话清理一起回收
+        self._session_gen_locks: dict[str, asyncio.Lock] = {}
+        # message_id 去重表：适配器重连/重放导致的重复事件只处理一次
+        self._seen_message_ids: dict[str, float] = {}
+        self._message_dedup_ttl = 600
 
         self.export_queue = VideoExportQueue(
             max_concurrent=self.max_concurrent_exports,
@@ -845,18 +854,8 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"保存会话时间戳失败: {e}")
 
     def _load_stats(self) -> dict:
-        """加载持久化的统计数据"""
-        try:
-            if self.stats_file.exists():
-                with open(self.stats_file, 'r', encoding='utf-8') as f:
-                    stats = json.load(f)
-                logger.info(f"已加载统计数据: {stats.get('total_exports', 0)} 个视频")
-                return stats
-        except Exception as e:
-            logger.warning(f"加载统计数据失败: {e}")
-        
-        # 默认统计数据
-        return {
+        """加载持久化的统计数据（缺键自动补默认值，防止 record_export 抛 KeyError）"""
+        defaults = {
             "total_exports": 0,
             "total_success": 0,
             "total_failed": 0,
@@ -864,6 +863,16 @@ class MySekaiStorytellerPlugin(Star):
             "first_export_at": None,
             "last_export_at": None
         }
+        try:
+            if self.stats_file.exists():
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    stats = json.load(f)
+                if isinstance(stats, dict):
+                    defaults.update(stats)
+                logger.info(f"已加载统计数据: {defaults.get('total_exports', 0)} 个视频")
+        except Exception as e:
+            logger.warning(f"加载统计数据失败: {e}")
+        return defaults
 
     def _save_stats(self):
         """保存统计数据到持久化文件"""
@@ -876,24 +885,27 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"保存统计数据失败: {e}")
 
     async def record_export(self, success: bool, duration_seconds: int = 0):
-        """记录一次视频导出"""
-        async with self._stats_lock:
-            now = time.time()
-            self.export_stats["total_exports"] += 1
-            if success:
-                self.export_stats["total_success"] += 1
-            else:
-                self.export_stats["total_failed"] += 1
-            self.export_stats["total_seconds"] += duration_seconds
-            self.export_stats["last_export_at"] = now
-            if self.export_stats.get("first_export_at") is None:
-                self.export_stats["first_export_at"] = now
-            self._save_stats()
-            logger.info(
-                f"导出统计: 总计={self.export_stats['total_exports']}, "
-                f"成功={self.export_stats['total_success']}, "
-                f"失败={self.export_stats['total_failed']}"
-            )
+        """记录一次视频导出（统计是旁路信息：任何异常只记日志，不影响导出主流程）"""
+        try:
+            async with self._stats_lock:
+                now = time.time()
+                self.export_stats["total_exports"] += 1
+                if success:
+                    self.export_stats["total_success"] += 1
+                else:
+                    self.export_stats["total_failed"] += 1
+                self.export_stats["total_seconds"] += duration_seconds
+                self.export_stats["last_export_at"] = now
+                if self.export_stats.get("first_export_at") is None:
+                    self.export_stats["first_export_at"] = now
+                self._save_stats()
+                logger.info(
+                    f"导出统计: 总计={self.export_stats['total_exports']}, "
+                    f"成功={self.export_stats['total_success']}, "
+                    f"失败={self.export_stats['total_failed']}"
+                )
+        except Exception as e:
+            logger.warning(f"导出统计记录失败（已忽略）: {e}")
 
     def get_stats_report(self) -> str:
         """获取统计报告"""
@@ -934,28 +946,42 @@ class MySekaiStorytellerPlugin(Star):
         return "\n".join(report)
 
     def _cleanup_old_files(self, max_age_hours: int = 2):
-        """清理超过指定时间的视频和剧本文件"""
+        """清理超过指定时间的视频和剧本文件。
+
+        temp_dir 可能指向共享目录：根目录只清理本插件命名（video_/story_ 前缀）的
+        文件，绝不按年龄无差别删除其他程序的数据。
+        """
         now = time.time()
         max_age_seconds = max_age_hours * 3600
         cleaned = 0
         freed_bytes = 0
 
-        for directory in [self.video_dir, self.story_dir, self.apifile_dir]:
+        def _try_delete(file) -> None:
+            nonlocal cleaned, freed_bytes
+            try:
+                if file.is_file() and (now - file.stat().st_mtime) > max_age_seconds:
+                    file_size = file.stat().st_size
+                    file.unlink()
+                    cleaned += 1
+                    freed_bytes += file_size
+                    logger.info(f"清理过期文件: {file.name} ({file_size / 1024:.1f} KB)")
+            except Exception as e:
+                logger.warning(f"清理文件失败 {file}: {e}")
+
+        for directory in [self.video_dir, self.story_dir]:
             if not directory.exists():
                 continue
             for file in directory.iterdir():
-                try:
-                    if file.is_file() and (now - file.stat().st_mtime) > max_age_seconds:
-                        file_size = file.stat().st_size
-                        file.unlink()
-                        cleaned += 1
-                        freed_bytes += file_size
-                        logger.info(f"清理过期文件: {file.name} ({file_size / 1024:.1f} KB)")
-                except Exception as e:
-                    logger.warning(f"清理文件失败 {file}: {e}")
+                _try_delete(file)
+
+        if self.apifile_dir.exists() and self.apifile_dir not in (self.video_dir, self.story_dir):
+            for file in self.apifile_dir.iterdir():
+                if file.name.startswith(("video_", "story_")):
+                    _try_delete(file)
 
         if cleaned > 0:
             logger.info(f"定时清理完成: 清理了 {cleaned} 个文件，释放 {freed_bytes / 1024 / 1024:.1f} MB 空间")
+        return cleaned
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         """获取或创建复用的 httpx 客户端"""
@@ -1011,11 +1037,13 @@ class MySekaiStorytellerPlugin(Star):
             return f"触发限流（{name}: {text}）"
         return f"{name}: {text}"
 
-    async def _text_chat_with_retry(self, prompt: str, system_prompt: Optional[str], label: str) -> Optional[str]:
+    async def _text_chat_with_retry(self, prompt: str, system_prompt: Optional[str], label: str,
+                                    failure_sink: Optional[list] = None) -> Optional[str]:
         """带重试与异常分类的 text_chat 封装；重试耗尽返回 None，不抛异常。
 
         每次异常连同堆栈记入日志（便于定位是网关压缩体、超时还是配置问题），
-        最终失败时汇总分类原因。
+        最终失败时汇总分类原因。failure_sink 是单元素列表：传入时把最终失败原因
+        写入 sink[0]，供本次调用链读取，避免多路并发把共享实例属性互相覆盖。
         """
         provider = self._get_provider()
         if not provider:
@@ -1028,8 +1056,6 @@ class MySekaiStorytellerPlugin(Star):
             or getattr(provider, "model", None)
             or type(provider).__name__
         )
-        # 重试耗尽后的失败原因（[模型] + 分类文案）；最终失败时随异常透传给用户
-        self._llm_failure_reason: Optional[str] = None
         last_reason = "LLM 响应为空"
         for attempt in range(len(self.LLM_RETRY_DELAYS) + 1):
             if attempt:
@@ -1042,6 +1068,9 @@ class MySekaiStorytellerPlugin(Star):
                     context=[],
                     system_prompt=system_prompt,
                 )
+                # completion_text 的取值也纳入重试保护：部分实现会在这里惰性解码，
+                # 抛出的异常同样按分类重试，而不是逃逸出本层
+                text = llm_resp.completion_text if llm_resp else None
             except Exception as e:
                 last_reason = self._describe_llm_error(e)
                 logger.warning(f"{label}[{provider_label}]: 调用异常 — {last_reason}", exc_info=True)
@@ -1050,7 +1079,6 @@ class MySekaiStorytellerPlugin(Star):
                 if "超时" in last_reason or "timed out" in last_reason.lower():
                     break
                 continue
-            text = llm_resp.completion_text if llm_resp else None
             if text and text.strip():
                 return text.strip()
             last_reason = "LLM 响应为空"
@@ -1058,12 +1086,18 @@ class MySekaiStorytellerPlugin(Star):
         logger.error(
             f"{label}[{provider_label}]失败（重试 {len(self.LLM_RETRY_DELAYS)} 次后放弃）— {last_reason}"
         )
-        self._llm_failure_reason = f"[{provider_label}] {last_reason}"
+        reason = f"[{provider_label}] {last_reason}"
+        if failure_sink is not None:
+            failure_sink.append(reason)
+        else:
+            self._llm_failure_reason = reason
         return None
 
-    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None,
+                        failure_sink: Optional[list] = None) -> Optional[str]:
         """通过 Astrbot 已配置的 LLM 提供商调用 AI（带重试与异常分类）"""
-        return await self._text_chat_with_retry(prompt, system_prompt, "LLM 调用")
+        return await self._text_chat_with_retry(prompt, system_prompt, "LLM 调用",
+                                                failure_sink=failure_sink)
 
     @staticmethod
     def _http_body_text(response) -> str:
@@ -1182,9 +1216,11 @@ class MySekaiStorytellerPlugin(Star):
                 label="批量翻译",
             )
             translations = self._extract_json_from_response(llm_text) if llm_text else None
-            if isinstance(translations, list) and len(translations) == len(need_translate):
+            # 元素必须全为字符串：null/对象等用 str() 强转会得到 "None" 之类的垃圾译文
+            if (isinstance(translations, list) and len(translations) == len(need_translate)
+                    and all(isinstance(t, str) for t in translations)):
                 for (snippet, data, _), translated in zip(need_translate, translations):
-                    data["ttsText"] = self._strip_translation(str(translated)) or data.get("content", "")
+                    data["ttsText"] = self._strip_translation(translated) or data.get("content", "")
                     snippet["data"] = data
                 logger.info(f"批量补充翻译完成: {len(need_translate)} 条")
                 return story_data
@@ -1193,14 +1229,26 @@ class MySekaiStorytellerPlugin(Star):
             logger.warning(f"批量翻译异常，回退逐条翻译: {e}")
 
         translated_count = 0
-        for snippet, data, content in need_translate:
+        for index, (snippet, data, content) in enumerate(need_translate):
+            if index >= TTS_FALLBACK_MAX_ITEMS:
+                # 逐条回退封顶：通道故障时不再为剩余台词继续打 LLM，
+                # 留空 ttsText 让宿主跳过配音，正文仍完整
+                data["ttsText"] = ""
+                snippet["data"] = data
+                continue
             data["ttsText"] = await self._translate_text(content, "zh", "ja")
             snippet["data"] = data
             translated_count += 1
+        if translated_count < len(need_translate):
+            logger.warning(
+                f"逐条翻译达到上限（{TTS_FALLBACK_MAX_ITEMS} 条），"
+                f"其余 {len(need_translate) - translated_count} 条跳过配音"
+            )
         logger.info(f"补充翻译完成: {translated_count}/{len(need_translate)} 条")
         return story_data
 
-    async def _call_llm_structured(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
+    async def _call_llm_structured(self, prompt: str, system_prompt: Optional[str] = None,
+                                   failure_sink: Optional[list] = None) -> Optional[str]:
         """
         调用 LLM 生成结构化 JSON 输出
         策略：先尝试 json_object 模式，失败则用普通调用
@@ -1217,6 +1265,7 @@ class MySekaiStorytellerPlugin(Star):
             model = provider_config.get("model_config", {}).get("model", "") if isinstance(provider_config.get("model_config"), dict) else provider_config.get("model", "")
 
             # 策略1: 尝试 json_object 模式（兼容性好，Gemini/OpenAI 都支持）
+            # 注：标准 AstrBot 配置的密钥键名是 "key" 而非 "api_key"，此路径通常不激活
             if api_base and api_key and model:
                 try:
                     result = await self._call_openai_json_object(api_base, api_key, model, prompt, system_prompt)
@@ -1226,11 +1275,11 @@ class MySekaiStorytellerPlugin(Star):
                     logger.warning(f"json_object 模式失败: {e}")
 
             # 策略2: 通过 Astrbot Provider 普通调用
-            return await self._call_llm(prompt, system_prompt)
+            return await self._call_llm(prompt, system_prompt, failure_sink=failure_sink)
 
         except Exception as e:
             logger.warning(f"结构化输出失败，回退到普通调用: {e}")
-            return await self._call_llm(prompt, system_prompt)
+            return await self._call_llm(prompt, system_prompt, failure_sink=failure_sink)
 
     async def _call_openai_json_object(self, api_base: str, api_key: str, model: str, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
         """使用 json_object 模式调用 API，确保返回合法 JSON"""
@@ -1723,7 +1772,7 @@ class MySekaiStorytellerPlugin(Star):
                 buckets.append("".join(sentence_parts[idx:idx + take]).strip())
                 idx += take
             return buckets
-        if line_parts:
+        if len(line_parts) >= group_count:
             # 保持原文连续顺序，不能按轮转分桶（否则 1/3/5 会跑到 2/4/6 前）。
             base, extra = divmod(len(line_parts), group_count)
             buckets = []
@@ -1733,6 +1782,9 @@ class MySekaiStorytellerPlugin(Star):
                 buckets.append("\n".join(line_parts[index:index + take]))
                 index += take
             return buckets
+        # 译文行数不足（如整段只有一行）无法按组忠实切分：与其把整段塞给第一条
+        # 造成"首条读全文、后续再补译"的重复朗读，不如全部留空交给补译流程
+        # 按各条的中文内容重新翻译
         return [""] * group_count
 
     @classmethod
@@ -1867,12 +1919,36 @@ class MySekaiStorytellerPlugin(Star):
             if snippet_type == "Talk":
                 data = snippet.get("data", {})
                 default_model = view.default_model()
-                data["speaker"] = self._to_str(data.get("speaker"), view.name_by_id(default_model.get("id")))
+                data["modelId"] = self._to_number(data.get("modelId"), default_model.get("id", 1))
+                # 说话人与 modelId 绑定：字幕/TTS 音色按 speaker、身体动作/嘴型按 modelId，
+                # 两者不一致时会出现"张嘴的角色不是配音的角色"。
+                # speaker 缺失或无法对应 modelId 的角色时，改写为该角色名——
+                # 场景按 modelId 排布，改 speaker 不会破坏在场校验（重绑 modelId 会）。
+                # 旁白（modelId=-1）不绑定。
+                model = view.model_by_id(data["modelId"])
+                speaker_raw = self._to_str(data.get("speaker"), "")
+                if model is not None and speaker_raw not in (model.get("name"), model.get("shortName")):
+                    bound = view.short_name(model)
+                    logger.info(
+                        f"snippets[{i}] Talk speaker '{speaker_raw or '（缺失）'}' 与 "
+                        f"modelId={data['modelId']} 的角色（{view.short_name(model)}）不符，已改写对齐"
+                    )
+                    data["speaker"] = bound
+                else:
+                    data["speaker"] = speaker_raw or view.name_by_id(default_model.get("id"))
                 content = self._to_str(data.get("content"), "...")
                 content = content.replace("\\n", "\n")
                 data["content"] = sanitize_display_text(content)
-                data["modelId"] = self._to_number(data.get("modelId"), default_model.get("id", 1))
                 data["voice"] = self._to_str(data.get("voice"), "")
+                # ttsText 必须是字符串：非字符串真值（数组/对象/数字）会让宿主解析失败，
+                # 空白串视为缺失——统一清空，交给 _ensure_tts_text 补译
+                tts_raw = data.get("ttsText")
+                if not isinstance(tts_raw, str) or not tts_raw.strip():
+                    if tts_raw:
+                        logger.warning(f"snippets[{i}] Talk ttsText 不是有效字符串（{type(tts_raw).__name__}），已清空待补译")
+                    data["ttsText"] = ""
+                else:
+                    data["ttsText"] = tts_raw
                 # 说话并发动作/表情：非法值回退该角色默认；空串 = 保持当前姿态不播
                 talk_motion = self._clean_path(self._to_str(data.get("motion"), ""))
                 if talk_motion and talk_motion not in view.valid_motions(data["modelId"]):
@@ -2099,8 +2175,14 @@ class MySekaiStorytellerPlugin(Star):
         logger.error(f"无法从响应中提取 JSON: {response[:200]}...")
         return None
 
-    async def _export_video(self, story_data: dict, timeout: int = 600, progress=None) -> dict:
-        """调用 MSS API 导出视频，并下载到本地"""
+    async def _export_video(self, story_data: dict, timeout: int = 600, progress=None,
+                            api_base: str = "") -> dict:
+        """调用 MSS API 导出视频，并下载到本地。
+
+        api_base 固定为生成时读到的宿主地址：在途任务不被 setapi 切换影响，
+        导出与下载始终指向同一宿主。
+        """
+        base = (api_base or self.mss_api_url).rstrip("/")
         try:
             export_timeout_ms = timeout * 1000
 
@@ -2111,7 +2193,7 @@ class MySekaiStorytellerPlugin(Star):
 
             client = await self._get_http_client()
             response = await client.post(
-                f"{self.mss_api_url}/api/v1/export",
+                f"{base}/api/v1/export",
                 json=body,
                 timeout=httpx.Timeout(timeout + 60, read=timeout + 60),
             )
@@ -2141,31 +2223,52 @@ class MySekaiStorytellerPlugin(Star):
             local_path = None
 
             if download_url:
-                full_url = f"{self.mss_api_url}{download_url}" if download_url.startswith("/") else download_url
+                full_url = f"{base}{download_url}" if download_url.startswith("/") else download_url
                 logger.info(f"Downloading video from: {full_url}")
-                logger.info(f"[调试] video_dir: {self.video_dir}")
-                logger.info(f"[调试] apifile_dir: {self.apifile_dir}")
                 for attempt in range(3):
+                    timestamp = int(time.time())
+                    part_path = self.video_dir / f"video_{timestamp}_{uuid.uuid4().hex[:8]}.part"
                     try:
                         client = await self._get_http_client()
-                        dl_response = await client.get(
-                            full_url,
-                            timeout=httpx.Timeout(300.0, read=300.0),
-                        )
-                        if dl_response.status_code == 200 and len(dl_response.content) > 0:
-                            timestamp = int(time.time())
-                            local_path = str(self.video_dir / f"video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4")
-                            logger.info(f"[调试] 生成的本地路径：{local_path}")
-                            if progress:
-                                await progress(90)
-                            with open(local_path, "wb") as f:
-                                f.write(dl_response.content)
-                            logger.info(f"Video downloaded: {local_path} ({len(dl_response.content)} bytes)")
-                            break
-                        else:
-                            logger.warning(f"Download attempt {attempt + 1} failed: HTTP {dl_response.status_code}, size={len(dl_response.content)}")
+                        async with client.stream(
+                            "GET", full_url, timeout=httpx.Timeout(300.0, read=300.0),
+                        ) as dl_response:
+                            if dl_response.status_code != 200:
+                                raise IOError(f"HTTP {dl_response.status_code}")
+                            total = int(dl_response.headers.get("content-length") or 0)
+                            downloaded = 0
+                            reported = 60
+                            # 流式落盘：字节级进度上报让队列看门狗在下载期也能看到推进，
+                            # 不再把正常传输误判为停滞
+                            with open(part_path, "wb") as f:
+                                async for chunk in dl_response.aiter_bytes(1 << 20):
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    if progress:
+                                        if total:
+                                            pct = 60 + min(29, int(30 * downloaded / total))
+                                        else:
+                                            pct = min(89, 60 + downloaded // (16 << 20) * 5)
+                                        if pct > reported:
+                                            reported = pct
+                                            await progress(pct)
+                            if total and downloaded < total:
+                                raise IOError(f"下载不完整（{downloaded}/{total} 字节）")
+                            if downloaded == 0:
+                                raise IOError("响应体为空")
+                        # 只有完整写入后才占用最终文件名：写失败不会把半截文件当成功
+                        local_path = str(self.video_dir / f"video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4")
+                        os.replace(part_path, local_path)
+                        if progress:
+                            await progress(90)
+                        logger.info(f"Video downloaded: {local_path} ({downloaded} bytes)")
+                        break
                     except Exception as e:
                         logger.warning(f"Download attempt {attempt + 1} error: {e}")
+                        try:
+                            part_path.unlink()
+                        except OSError:
+                            pass
                     if attempt < 2:
                         await asyncio.sleep(3)
 
@@ -2280,15 +2383,24 @@ class MySekaiStorytellerPlugin(Star):
             yield event.plain_result(f"视频导出服务不可用\n\n{health['message']}")
             return
 
+        if not self._claim_message(event):
+            return
+
         user_id = str(event.get_sender_id())
+        session_key = self._session_key(event)
 
         await self._ensure_queue_processor_started()
 
+        # 生成前先看渲染队列容量：满员时直接拒绝，不再白花一次剧本生成的费用
+        backlog = await self._queue_backlog()
+        if backlog >= self.export_queue.max_queue_size:
+            yield event.plain_result(f"渲染排队已满（{backlog}），请稍后再试")
+            return
+
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "chat"))
-        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, session_key, event_context, backlog))
 
     @filter.command("剧本生成", alias={'剧本对话', '故事生成', 'story', '生成剧本', '生成故事'})
     async def mss_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2308,14 +2420,23 @@ class MySekaiStorytellerPlugin(Star):
             yield event.plain_result(f"视频导出服务不可用\n\n{health['message']}")
             return
 
+        if not self._claim_message(event):
+            return
+
         user_id = str(event.get_sender_id())
+        session_key = self._session_key(event)
         await self._ensure_queue_processor_started()
+
+        # 生成前先看渲染队列容量：满员时直接拒绝，不再白花一次剧本生成的费用
+        backlog = await self._queue_backlog()
+        if backlog >= self.export_queue.max_queue_size:
+            yield event.plain_result(f"渲染排队已满（{backlog}），请稍后再试")
+            return
 
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "story"))
-        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, session_key, event_context, backlog))
 
     @filter.command("测试视频对话", alias={'测试视频生成', '测试视频聊天'})
     async def mss_test_chat_mode(self, event: AstrMessageEvent, message: str):
@@ -2329,15 +2450,23 @@ class MySekaiStorytellerPlugin(Star):
             yield event.plain_result(f"视频导出服务不可用\n\n{health['message']}")
             return
 
+        if not self._claim_message(event):
+            return
+
         user_id = str(event.get_sender_id())
+        session_key = self._session_key(event)
 
         await self._ensure_queue_processor_started()
 
+        backlog = await self._queue_backlog()
+        if backlog >= self.export_queue.max_queue_size:
+            yield event.plain_result(f"渲染排队已满（{backlog}），请稍后再试")
+            return
+
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "chat"))
-        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_chat(event, message, user_id, session_key, event_context, backlog))
 
     @filter.command("测试剧本生成", alias={'测试故事生成', '测试story', '测试生成剧本'})
     async def mss_test_story_mode(self, event: AstrMessageEvent, scene: str):
@@ -2351,15 +2480,45 @@ class MySekaiStorytellerPlugin(Star):
             yield event.plain_result(f"视频导出服务不可用\n\n{health['message']}")
             return
 
+        if not self._claim_message(event):
+            return
+
         user_id = str(event.get_sender_id())
+        session_key = self._session_key(event)
 
         await self._ensure_queue_processor_started()
 
+        backlog = await self._queue_backlog()
+        if backlog >= self.export_queue.max_queue_size:
+            yield event.plain_result(f"渲染排队已满（{backlog}），请稍后再试")
+            return
+
         # 剧本并行生成（不占导出队列），完成后自动入导出队列渲染并发送
         event_context = self._extract_event_context(event)
-        backlog = await self._queue_backlog()
         yield event.plain_result(self._initial_reply(backlog, "story"))
-        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, event_context, backlog))
+        self._spawn_pipeline(self._pipeline_story(event, scene, user_id, session_key, event_context, backlog))
+
+    def _claim_message(self, event: AstrMessageEvent) -> bool:
+        """按 message_id 去重：适配器重连/重放导致的重复事件只处理一次。"""
+        mid = str(getattr(event, 'message_id', '') or '')
+        if not mid:
+            return True
+        now = time.time()
+        seen = self._seen_message_ids
+        last = seen.get(mid)
+        if last is not None and now - last < self._message_dedup_ttl:
+            logger.warning(f"重复消息事件已忽略: {mid}")
+            return False
+        seen[mid] = now
+        if len(seen) > 1024:
+            # dict 保持插入序，近似淘汰最旧的一批
+            for old_id in list(seen)[:len(seen) - 1024]:
+                del seen[old_id]
+        return True
+
+    def _session_key(self, event: AstrMessageEvent) -> str:
+        """会话键：unified_msg_origin 精确到聊天上下文，私聊/不同群/不同平台互不串历史。"""
+        return str(getattr(event, 'unified_msg_origin', '') or event.get_sender_id())
 
     def _extract_event_context(self, event: AstrMessageEvent) -> dict:
         """提取事件上下文信息，用于后续消息发送"""
@@ -2479,15 +2638,18 @@ class MySekaiStorytellerPlugin(Star):
             if not user_id:
                 user_id = str(event.get_sender_id())
 
-            # 先发送艾特通知
+            # 先发送艾特通知；通知是锦上添花，失败绝不拦住视频发送本身
             if user_id:
                 try:
-                    qq_id = int(user_id)
-                    notify_chain = MessageChain(chain=[Comp.At(qq=qq_id)])
-                except (ValueError, TypeError):
-                    notify_chain = MessageChain(chain=[Comp.At(qq=user_id)])
-                await self.context.send_message(unified_msg_origin, notify_chain)
-                logger.info(f"[发送视频] 已发送艾特通知: user_id={user_id}")
+                    try:
+                        qq_id = int(user_id)
+                        notify_chain = MessageChain(chain=[Comp.At(qq=qq_id)])
+                    except (ValueError, TypeError):
+                        notify_chain = MessageChain(chain=[Comp.At(qq=user_id)])
+                    await self.context.send_message(unified_msg_origin, notify_chain)
+                    logger.info(f"[发送视频] 已发送艾特通知: user_id={user_id}")
+                except Exception as e:
+                    logger.warning(f"[发送视频] 艾特通知发送失败（不影响视频发送）: {e}")
 
             # 第1重：使用已下载的本地文件发送
             if local_path and os.path.exists(local_path):
@@ -2572,34 +2734,43 @@ class MySekaiStorytellerPlugin(Star):
             await self._send_safe_message(event, f"❌ 视频发送失败: {str(e)}", event_context)
 
     async def _send_safe_message(self, event: AstrMessageEvent, message: str, event_context: dict = None):
-        """安全发送消息（避免异常）"""
-        try:
-            unified_msg_origin = event_context.get("unified_msg_origin", "") if event_context else getattr(event, 'unified_msg_origin', '')
-            user_id = event_context.get("user_id", "") if event_context else str(event.get_sender_id())
+        """安全发送消息（避免异常）；艾特失败时降级为纯文本重试一次。"""
+        unified_msg_origin = event_context.get("unified_msg_origin", "") if event_context else getattr(event, 'unified_msg_origin', '')
+        user_id = event_context.get("user_id", "") if event_context else str(event.get_sender_id())
 
+        async def _send(with_at: bool) -> None:
             chain = []
-            if user_id:
+            if with_at and user_id:
                 chain.append(Comp.At(qq=user_id))
             chain.append(Comp.Plain(message))
-
             await self.context.send_message(unified_msg_origin, MessageChain(chain=chain))
-        except Exception as e:
-            logger.error(f"发送消息失败: {e}")
 
-    async def _generate_chat_story(self, message: str, user_id: str) -> tuple:
+        try:
+            await _send(True)
+        except Exception as e:
+            logger.error(f"发送消息失败（尝试纯文本重试）: {e}")
+            try:
+                await _send(False)
+            except Exception as e2:
+                logger.error(f"纯文本消息也发送失败: {e2}")
+
+    async def _generate_chat_story(self, message: str, history_key: str) -> tuple:
         """LLM 生成对话剧本（含校验重试），返回 (story_data, 首个说话角色)。
-        只做剧本阶段，不涉及视频导出——由调用方决定何时入导出队列。"""
-        system_prompt, base_prompt = await self._build_chat_prompt(message, user_id)
+        只做剧本阶段，不涉及视频导出——由调用方决定何时入导出队列。
+        history_key 是会话键（unified_msg_origin），聊天历史按会话隔离。"""
+        system_prompt, base_prompt = await self._build_chat_prompt(message, history_key)
         max_retries = 2
         validated: Optional[dict] = None  # 只有校验通过的剧本才算数，失败轮的坏剧本不得流出
         last_failure = "LLM 未返回内容"
+        failure_sink: list = []  # 本次调用链的失败原因；并发下各自独立，不再串值
         user_prompt = base_prompt
 
         for attempt in range(max_retries + 1):
             # 请求发出即打日志：慢模型一次 4-5 分钟，期间不能再是"完全没影"的静默窗
             logger.info(f"剧本生成第 {attempt + 1}/{max_retries + 1} 轮：请求已发出，等待模型返回…")
             started = time.monotonic()
-            llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            llm_response = await self._call_llm_structured(user_prompt, system_prompt,
+                                                           failure_sink=failure_sink)
             elapsed = time.monotonic() - started
             if not llm_response:
                 last_failure = "LLM 调用失败"
@@ -2614,6 +2785,12 @@ class MySekaiStorytellerPlugin(Star):
             if not story_data:
                 if attempt < max_retries:
                     logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
+                    # 与校验失败同样的定向修正：带上次原文与原始要求，而不是原样重发
+                    user_prompt = (
+                        f"上次输出无法解析为 JSON。请重新只输出合法 JSON（仅含 models、images、snippets，"
+                        f"不要 markdown 代码块和解释）。上次输出开头：\n{llm_response[:500]}\n\n"
+                        f"原始要求：\n\n{base_prompt}"
+                    )
                     continue
                 raise ValueError("AI 返回的内容无法解析为 JSON")
 
@@ -2623,7 +2800,7 @@ class MySekaiStorytellerPlugin(Star):
             except ValueError as e:
                 validated = None
                 if attempt < max_retries:
-                    logger.warning(f"验证失败，重试 ({attempt+1}/{max_retries}): {e}")
+                    logger.warning(f"验证失败，重试 ({attempt + 1}/{max_retries}): {e}")
                     # 修复轮 = 固定原始要求 + 最近一次的问题剧本 + 具体错误，
                     # 让模型定向修改而不是盲写全场；不叠加历史轮，避免提示词递归膨胀
                     user_prompt = (
@@ -2637,22 +2814,26 @@ class MySekaiStorytellerPlugin(Star):
         if validated is None:
             # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
             # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
-            detail = getattr(self, "_llm_failure_reason", None)
+            detail = failure_sink[-1] if failure_sink else getattr(self, "_llm_failure_reason", None)
             raise ValueError(
                 f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
             )
 
         story_data = await self._ensure_tts_text(validated)
 
-        # 添加聊天历史（role 记录本次实际说话的角色）
-        first_content = ""
+        # 添加聊天历史：记录本次全部台词（只存第一条会漏掉实际回复的大半内容）
         first_speaker = ""
+        talk_lines: list[str] = []
         for s in story_data.get("snippets", []):
             if s.get("type") == "Talk":
-                first_content = s.get("data", {}).get("content", "")
-                first_speaker = s.get("data", {}).get("speaker", "")
-                break
-        await self._add_chat_history(user_id, message, first_content, first_speaker)
+                if not first_speaker:
+                    first_speaker = s.get("data", {}).get("speaker", "")
+                line = s.get("data", {}).get("content", "")
+                if line:
+                    talk_lines.append(line)
+        bot_content = "\n".join(talk_lines)
+        if bot_content:
+            await self._add_chat_history(history_key, message, bot_content, first_speaker)
         return story_data, first_speaker
 
     async def _generate_story(self, scene: str) -> dict:
@@ -2661,13 +2842,15 @@ class MySekaiStorytellerPlugin(Star):
         max_retries = 2
         validated: Optional[dict] = None  # 只有校验通过的剧本才算数，失败轮的坏剧本不得流出
         last_failure = "LLM 未返回内容"
+        failure_sink: list = []  # 本次调用链的失败原因；并发下各自独立，不再串值
         user_prompt = base_prompt
 
         for attempt in range(max_retries + 1):
             # 请求发出即打日志：慢模型一次 4-5 分钟，期间不能再是"完全没影"的静默窗
             logger.info(f"剧本生成第 {attempt + 1}/{max_retries + 1} 轮：请求已发出，等待模型返回…")
             started = time.monotonic()
-            llm_response = await self._call_llm_structured(user_prompt, system_prompt)
+            llm_response = await self._call_llm_structured(user_prompt, system_prompt,
+                                                           failure_sink=failure_sink)
             elapsed = time.monotonic() - started
             if not llm_response:
                 last_failure = "LLM 调用失败"
@@ -2682,6 +2865,12 @@ class MySekaiStorytellerPlugin(Star):
             if not story_data:
                 if attempt < max_retries:
                     logger.warning(f"JSON解析失败，重试 ({attempt+1}/{max_retries})")
+                    # 与校验失败同样的定向修正：带上次原文与原始要求，而不是原样重发
+                    user_prompt = (
+                        f"上次输出无法解析为 JSON。请重新只输出合法 JSON（仅含 models、images、snippets，"
+                        f"不要 markdown 代码块和解释）。上次输出开头：\n{llm_response[:500]}\n\n"
+                        f"原始要求：\n\n{base_prompt}"
+                    )
                     continue
                 raise ValueError("AI 返回的内容无法解析为 JSON")
 
@@ -2705,7 +2894,7 @@ class MySekaiStorytellerPlugin(Star):
         if validated is None:
             # 多次重试仍失败：把归类原因（[模型] + 具体问题）直接透传给用户，
             # 避免"语言模型未就绪"这类笼统提示掩盖了是哪一家模型/中转在返回空响应
-            detail = getattr(self, "_llm_failure_reason", None)
+            detail = failure_sink[-1] if failure_sink else getattr(self, "_llm_failure_reason", None)
             raise ValueError(
                 f"{last_failure}（已重试 {max_retries} 次，请稍后再试）" + (f"— {detail}" if detail else "")
             )
@@ -2728,7 +2917,7 @@ class MySekaiStorytellerPlugin(Star):
     async def _enqueue_export_and_monitor(self, event, event_context: dict, user_id: str,
                                           story_data: dict, description: str,
                                           priority: int, wait_kind: str,
-                                          reported_position: int = 0):
+                                          reported_position: int = 0, api_base: str = ""):
         """剧本完成后入导出队列并监控发送。剧本阶段已结束，这里只处理导出。"""
         try:
             task_id = await self.export_queue.add_task(
@@ -2739,7 +2928,8 @@ class MySekaiStorytellerPlugin(Star):
                     "story_data": story_data,
                     "sender_id": user_id,
                     "description": description,
-                    "event_context": event_context
+                    "event_context": event_context,
+                    "api_base": api_base,
                 },
                 progress_arg="progress"
             )
@@ -2749,20 +2939,29 @@ class MySekaiStorytellerPlugin(Star):
 
         await self._monitor_and_send_video(task_id, event, event_context)
 
-    async def _pipeline_chat(self, event, message: str, user_id: str, event_context: dict = None,
-                             reported_position: int = 0):
-        """对话模式流水线：剧本（受 _script_semaphore 并发 + 墙钟超时）→ 导出队列（串行渲染）"""
+    async def _pipeline_chat(self, event, message: str, user_id: str, session_key: str,
+                             event_context: dict = None, reported_position: int = 0):
+        """对话模式流水线：剧本（同会话串行 + 全局并发闸 + 墙钟超时）→ 导出队列（串行渲染）。
+
+        墙钟超时包住整个生成函数：等待会话锁/信号量的时间同样计入，
+        不会出现"排队数小时却永远不触发超时"的无限等待。
+        """
         try:
-            async with self._script_semaphore:
-                story_data, first_speaker = await asyncio.wait_for(
-                    self._generate_chat_story(message, user_id),
-                    timeout=self.script_timeout,
-                )
+            api_base = self.mss_api_url
+
+            async def _generate():
+                lock = self._session_gen_locks.setdefault(session_key, asyncio.Lock())
+                async with lock:
+                    async with self._script_semaphore:
+                        return await self._generate_chat_story(message, session_key)
+
+            story_data, first_speaker = await asyncio.wait_for(_generate(), timeout=self.script_timeout)
             await self._enqueue_export_and_monitor(
                 event, event_context, user_id=user_id,
                 story_data=story_data,
                 description=f"{first_speaker}的回复" if first_speaker else "角色回复",
-                priority=1, wait_kind="chat", reported_position=reported_position
+                priority=1, wait_kind="chat", reported_position=reported_position,
+                api_base=api_base,
             )
         except asyncio.TimeoutError:
             logger.warning(f"剧本生成超时（{self.script_timeout} 秒），已中止: user={user_id}")
@@ -2773,20 +2972,25 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"对话剧本生成失败: {e}")
             await self._send_safe_message(event, self._user_error(e), event_context)
 
-    async def _pipeline_story(self, event, scene: str, sender_id: str, event_context: dict = None,
-                              reported_position: int = 0):
-        """剧本模式流水线：剧本（受 _script_semaphore 并发 + 墙钟超时）→ 导出队列（串行渲染）"""
+    async def _pipeline_story(self, event, scene: str, sender_id: str, session_key: str,
+                              event_context: dict = None, reported_position: int = 0):
+        """剧本模式流水线：剧本（同会话串行 + 全局并发闸 + 墙钟超时）→ 导出队列（串行渲染）。"""
         try:
-            async with self._script_semaphore:
-                story_data = await asyncio.wait_for(
-                    self._generate_story(scene),
-                    timeout=self.script_timeout,
-                )
+            api_base = self.mss_api_url
+
+            async def _generate():
+                lock = self._session_gen_locks.setdefault(session_key, asyncio.Lock())
+                async with lock:
+                    async with self._script_semaphore:
+                        return await self._generate_story(scene)
+
+            story_data = await asyncio.wait_for(_generate(), timeout=self.script_timeout)
             await self._enqueue_export_and_monitor(
                 event, event_context, user_id=sender_id,
                 story_data=story_data,
                 description=scene,
-                priority=2, wait_kind="story", reported_position=reported_position
+                priority=2, wait_kind="story", reported_position=reported_position,
+                api_base=api_base,
             )
         except asyncio.TimeoutError:
             logger.warning(f"剧本生成超时（{self.script_timeout} 秒），已中止: user={sender_id}")
@@ -2797,8 +3001,14 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"剧本生成失败: {e}")
             await self._send_safe_message(event, self._user_error(e), event_context)
 
-    async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频", event_context: dict = None, progress=None) -> dict:
-        """队列任务调用的视频导出方法"""
+    async def _queued_export_and_send(self, story_data: dict, sender_id: str = "", description: str = "视频",
+                                      event_context: dict = None, progress=None, api_base: str = "") -> dict:
+        """队列任务调用的视频导出方法。
+
+        渲染失败以异常上抛：瞬时故障（正忙/5xx/连接类）由队列按重试预算自动重试；
+        重试必然复现的失败（任务超时、下载终败）抛 PermanentTaskError 直接结算，
+        避免同一段视频反复渲染。渲染成功后的统计异常不影响结果（record_export 已自吞）。
+        """
         timestamp = int(time.time())
         story_path = self.story_dir / f"story_{timestamp}_{uuid.uuid4().hex[:8]}.json"
         try:
@@ -2808,70 +3018,14 @@ class MySekaiStorytellerPlugin(Star):
         except Exception as e:
             logger.warning(f"保存剧本失败: {e}")
 
-        task_key = f"export_{timestamp}_{uuid.uuid4().hex[:8]}"
-        self.active_exports.add(task_key)
         start_time = time.time()
 
-        try:
-            result = await self._export_video(story_data, self.export_timeout, progress)
-
-            self.active_exports.discard(task_key)
-            elapsed = int(time.time() - start_time)
-
-            # 记录统计数据
-            await self.record_export(result.get("success", False), elapsed)
-
-            if result.get("success"):
-                local_path = result.get("localPath", "")
-                download_url = result.get("downloadUrl", "")
-                file_size = result.get("fileSize", 0)
-
-                if local_path:
-                    local_path = self._fix_double_slash_path(local_path)
-                    file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-
-                # 构建完整的下载 URL
-                full_download_url = None
-                if download_url:
-                    full_download_url = f"{self.mss_api_url}{download_url}" if download_url.startswith("/") else download_url
-                
-                return {
-                    "success": True,
-                    "localPath": local_path,
-                    "downloadUrl": full_download_url,
-                    "message": f"🎬 视频导出成功！\n⏱️ 总耗时: {elapsed}秒\n📦 大小: {file_size / 1024 / 1024:.1f} MB",
-                    "elapsed": elapsed,
-                    "fileSize": file_size
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": result.get("message", "未知错误")
-                }
-        except Exception as e:
-            self.active_exports.discard(task_key)
-            logger.error(f"视频导出异常: {e}")
-            raise
-
-    async def _export_and_send_video(self, story_data: dict, event, description: str = "视频"):
-        """导出视频并发送给用户（聊天模式和剧本模式共用）"""
-        timestamp = int(time.time())
-        story_path = self.story_dir / f"story_{timestamp}_{uuid.uuid4().hex[:8]}.json"
-        try:
-            with open(str(story_path), "w", encoding="utf-8") as f:
-                json.dump(story_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"剧本已保存: {story_path}")
-        except Exception as e:
-            logger.warning(f"保存剧本失败: {e}")
-
-        task_key = f"export_{timestamp}_{id(story_data)}"
-        self.active_exports.add(task_key)
-        start_time = time.time()
-
-        result = await self._export_video(story_data, self.export_timeout)
-
-        self.active_exports.discard(task_key)
+        result = await self._export_video(story_data, self.export_timeout, progress,
+                                          api_base=api_base or self.mss_api_url)
         elapsed = int(time.time() - start_time)
+
+        # 记录统计数据（异常自吞，不影响导出结果）
+        await self.record_export(result.get("success", False), elapsed)
 
         if result.get("success"):
             local_path = result.get("localPath", "")
@@ -2882,96 +3036,24 @@ class MySekaiStorytellerPlugin(Star):
                 local_path = self._fix_double_slash_path(local_path)
                 file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
 
-            # 优先使用已下载的本地文件发送
-            if local_path and os.path.exists(local_path):
-                try:
-                    yield event.chain_result([
-                        Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                        Comp.Video.fromFileSystem(path=local_path)
-                    ])
-                    return
-                except Exception as e:
-                    logger.warning(f"Video.fromFileSystem failed: {e}, trying URL...")
-
-            # 第2重：使用 HTTP URL 发送（尝试多种 URL 变体）
-            video_url = None
+            # 构建完整的下载 URL
+            full_download_url = None
             if download_url:
-                video_url = f"{self.mss_api_url}{download_url}" if download_url.startswith("/") else download_url
+                full_download_url = f"{api_base or self.mss_api_url}{download_url}" if download_url.startswith("/") else download_url
 
-            if video_url:
-                for url_variant in self._get_accessible_download_urls(video_url):
-                    try:
-                        yield event.chain_result([
-                            Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                            Comp.Video.fromURL(url=url_variant)
-                        ])
-                        return
-                    except Exception as e:
-                        logger.warning(f"Video.fromURL failed ({url_variant}): {e}")
-
-            # 第3重：使用 AstrBot 文件服务注册视频
-            if local_path and os.path.exists(local_path):
-                try:
-                    video = Comp.Video(file=local_path)
-                    file_service_url = await video.register_to_file_service()
-                    if self.callback_api_base and file_service_url:
-                        from urllib.parse import urlparse, urlunparse
-                        parsed = urlparse(file_service_url)
-                        cb_parsed = urlparse(self.callback_api_base)
-                        file_service_url = urlunparse((cb_parsed.scheme, cb_parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
-                        logger.info(f"[文件服务] 使用 callback_api_base 替换: {file_service_url}")
-                    logger.info(f"文件服务注册成功: {file_service_url}")
-                    yield event.chain_result([
-                        Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                        Comp.Video.fromURL(url=file_service_url)
-                    ])
-                    return
-                except Exception as e:
-                    logger.warning(f"文件服务发送失败：{e}")
-
-            # 第4重：手动注册到文件服务，用配置的 callback_api_base 或自检测 IP 构造可访问 URL
-            if local_path and os.path.exists(local_path):
-                try:
-                    from astrbot.core import file_token_service, astrbot_config as ast_conf
-                    token = await file_token_service.register_file(local_path)
-                    if self.callback_api_base:
-                        file_url = f"{self.callback_api_base}/api/file/{token}"
-                    else:
-                        dashboard_port = ast_conf.get("dashboard", {}).get("port", 6185)
-                        host_ip = self._detect_host_ip()
-                        if not host_ip:
-                            raise RuntimeError("无法检测宿主机 IP 且未配置 callback_api_base")
-                        file_url = f"http://{host_ip}:{dashboard_port}/api/file/{token}"
-                    yield event.chain_result([
-                        Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                        Comp.Video.fromURL(url=file_url)
-                    ])
-                    return
-                except Exception as e:
-                    logger.warning(f"手动文件服务发送失败：{e}")
-
-            if local_path and os.path.exists(local_path):
-                normalized_path = local_path.replace('\\', '/')
-                normalized_path = '/' + normalized_path.lstrip('/')
-                try:
-                    yield event.chain_result([
-                        Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                        Comp.Video(file=normalized_path, path=normalized_path)
-                    ])
-                except Exception as e:
-                    logger.warning(f"Video file send also failed: {e}")
-                    try:
-                        yield event.chain_result([
-                            Comp.Plain(f"视频导出成功！\n总耗时: {elapsed}秒\n大小: {file_size / 1024 / 1024:.1f} MB"),
-                            Comp.Video(file=normalized_path)
-                        ])
-                    except Exception as e2:
-                        logger.error(f"All video send methods failed: {e2}")
-                        yield event.plain_result(f"视频导出成功但发送失败\n下载地址: {video_url}\n文件路径: {normalized_path}\n大小: {file_size / 1024 / 1024:.1f} MB")
-            else:
-                yield event.plain_result(f"视频导出成功但文件丢失")
-        else:
-            yield event.plain_result(f"视频导出失败: {result.get('message', '未知错误')}")
+            return {
+                "success": True,
+                "localPath": local_path,
+                "downloadUrl": full_download_url,
+                "message": f"🎬 视频导出成功！\n⏱️ 总耗时: {elapsed}秒\n📦 大小: {file_size / 1024 / 1024:.1f} MB",
+                "elapsed": elapsed,
+                "fileSize": file_size
+            }
+        message = result.get("message", "未知错误")
+        logger.error(f"视频导出失败（任务将按类型决定是否重试）: {message}")
+        if "超时" in message or "无法下载" in message:
+            raise PermanentTaskError(message)
+        raise RuntimeError(message)
 
     @filter.command_group("mssadmin")
     def mssadmin(self):
@@ -3023,21 +3105,13 @@ class MySekaiStorytellerPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cleanup(self, event: AstrMessageEvent):
         """清理文件"""
-        cleaned = 0
+        # 与定时清理同口径：只删超过 2 小时的产物，不碰刚生成、可能正在发送的文件
         try:
-            for directory in [self.video_dir, self.story_dir]:
-                if not directory.exists():
-                    continue
-                for file in directory.iterdir():
-                    try:
-                        if file.is_file():
-                            file.unlink()
-                            cleaned += 1
-                    except Exception as e:
-                        logger.error(f"清理文件失败 {file}: {e}")
+            cleaned = self._cleanup_old_files(max_age_hours=2)
         except Exception as e:
             logger.error(f"清理文件失败: {e}")
-        yield event.plain_result(f"已清理 {cleaned} 个文件")
+            cleaned = 0
+        yield event.plain_result(f"已清理 {cleaned} 个超过 2 小时的文件")
 
     @mssadmin.command("resources", alias={'资源列表', '模型列表', '资源'})
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -3087,8 +3161,14 @@ class MySekaiStorytellerPlugin(Star):
         self.mss_api_url = url
         self.config["mss_api_url"] = url
         self.config.save_config()
-        # API 地址变更后，资源目录客户端同步切到新地址
+        # API 地址变更后，资源目录客户端同步切到新地址；旧客户端显式关闭，不泄漏连接
+        old_catalog = self._catalog
         self._catalog = ResourceCatalog(url)
+        if old_catalog._client and not old_catalog._client.is_closed:
+            try:
+                await old_catalog._client.aclose()
+            except Exception as e:
+                logger.warning(f"关闭旧资源目录客户端失败: {e}")
         health = await self._check_mss_api_health()
         if health["status"] == "ok":
             yield event.plain_result(f"✅ API地址已更新: {url}")

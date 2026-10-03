@@ -39,6 +39,13 @@ class QueueTask:
     progress_arg: Optional[str] = None
     progress: int = 0
     worker: Optional[asyncio.Task] = None
+    # 执行代次：每次重试自增。旧执行者的收尾凭它识别自己已过时，
+    # 避免把新一代执行误判为"任务异常退出"或误删其运行登记。
+    generation: int = 0
+    # 取消意图标记：协程的清理代码若在取消后抛出普通异常，据此按取消而非失败结算
+    cancel_requested: bool = False
+    # 该任务当前运行登记对应的执行代次：旧执行者收尾时凭它判断登记是否还是自己的
+    registered_generation: int = -1
 
 
 class VideoExportQueue:
@@ -65,6 +72,8 @@ class VideoExportQueue:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._processor_task: Optional[asyncio.Task] = None
         self._running = False
+        # 显式停止标记：stop() 之后拒绝新任务入队；首次 start 之前允许预入队
+        self._stopped = False
         self._stats = {
             "total_enqueued": 0,
             "total_completed": 0,
@@ -79,42 +88,53 @@ class VideoExportQueue:
             if self._running:
                 return
             self._running = True
+            self._stopped = False
             self._processor_task = asyncio.create_task(self.process_queue())
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
             logger.info(f"视频导出队列已启动（并发={self._max_concurrent}, 容量={self._max_queue_size}）")
 
     async def stop(self):
-        """停止队列处理器，并收尾所有排队/运行中的任务（等待方会被唤醒）"""
-        self._running = False
-        if self._processor_task:
-            self._processor_task.cancel()
-            try:
-                await self._processor_task
-            except asyncio.CancelledError:
-                pass
-            self._processor_task = None
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            self._cleanup_task = None
+        """停止队列处理器，并收尾所有排队/运行中的任务（等待方会被唤醒）。
 
-        async with self._lock:
-            pending = [t for t in self._queue if t.status == TaskStatus.PENDING]
-            self._queue = [t for t in self._queue if t.status != TaskStatus.PENDING]
-            running = list(self._running_tasks.values())
-        for task in pending:
-            self._settle(task, TaskStatus.CANCELLED, error="队列已停止")
-        workers = [t.worker for t in running if t.worker and not t.worker.done()]
-        for task in running:
-            if task.worker and not task.worker.done():
-                task.worker.cancel()
-        # 等被取消的协程真正退出（清理逻辑跑完），stop 返回后即无残留后台任务
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
-        logger.info("视频导出队列已停止")
+        与 start 共用生命周期锁：并发 start/stop 不会互相覆盖后台任务引用。
+        """
+        async with self._start_lock:
+            self._stopped = True
+            self._running = False
+            if self._processor_task:
+                self._processor_task.cancel()
+                try:
+                    await self._processor_task
+                except asyncio.CancelledError:
+                    pass
+                self._processor_task = None
+            if self._cleanup_task:
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                self._cleanup_task = None
+
+            async with self._lock:
+                pending = [t for t in self._queue if t.status == TaskStatus.PENDING]
+                self._queue = [t for t in self._queue if t.status != TaskStatus.PENDING]
+                running = list(self._running_tasks.values())
+            for task in pending:
+                self._settle(task, TaskStatus.CANCELLED, error="队列已停止")
+            workers = []
+            for task in running:
+                if task.worker and not task.worker.done():
+                    task.cancel_requested = True
+                    task.worker.cancel()
+                    workers.append(task.worker)
+                elif task.worker is None:
+                    # 已登记执行但尚未启动：直接结算，执行入口的终态守卫会阻止其稍后启动
+                    self._settle(task, TaskStatus.CANCELLED, error="队列已停止")
+            # 已 done 的 worker 由其外层执行者收尾：失败处理会看到停止标记并按取消结算
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+            logger.info("视频导出队列已停止")
 
     async def add_task(self, user_id: str, coroutine_func: Callable,
                        priority: int = 0, args: tuple = (), kwargs: dict = None,
@@ -126,6 +146,9 @@ class VideoExportQueue:
         注入 ``async def report(value)`` 回调；超时后的收尾宽限据此判断任务是否仍在推进。
         """
         async with self._lock:
+            # 停止后拒绝新任务；start 之前允许预入队（处理器启动后即消费）
+            if self._stopped and not self._running:
+                raise QueueFullError("导出队列已停止，请稍后再试")
             pending_and_running = (
                 sum(1 for t in self._queue if t.status == TaskStatus.PENDING)
                 + len(self._running_tasks)
@@ -234,11 +257,16 @@ class VideoExportQueue:
                 return False
 
             if task.status == TaskStatus.PENDING:
-                self._queue.remove(task)
+                for index, queued in enumerate(self._queue):
+                    if queued.task_id == task.task_id:
+                        del self._queue[index]
+                        break
                 self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
                 logger.info(f"任务已取消: {task_id[:8]}")
                 return True
             if task.status == TaskStatus.RUNNING:
+                # 先记下取消意图：即使协程清理代码随后抛普通异常，也按取消结算
+                task.cancel_requested = True
                 if task.worker and not task.worker.done():
                     task.worker.cancel()
                     logger.info(f"运行中任务已请求取消: {task_id[:8]}")
@@ -335,6 +363,7 @@ class VideoExportQueue:
                         processed_users.add(task.user_id)
                         task.status = TaskStatus.RUNNING
                         task.started_at = time.time()
+                        task.registered_generation = task.generation
                         self._running_tasks[task.task_id] = task
                         tasks_to_start.append(task)
 
@@ -400,17 +429,19 @@ class VideoExportQueue:
         """
         grace = self._timeout_grace_seconds
         step = self._progress_check_seconds
-        started = task.started_at or time.time()
-        hard_deadline = started + task.timeout_seconds + 3 * grace
+        # 绝对上限按单调时钟计算（不受系统校时影响）；已消耗的执行时长按墙钟折算
+        started_mono = time.monotonic()
+        consumed = max(0.0, time.time() - (task.started_at or time.time()))
+        hard_deadline = started_mono + max(0.0, task.timeout_seconds + 3 * grace - consumed)
         last_seen = task.progress
-        last_change = time.time()
+        last_change = started_mono
         landing_done = False
         logger.warning(
             f"任务到达执行时限，进入收尾宽限（{grace}s 静默判停，有进度则顺延）: "
             f"{task.task_id[:8]}, 用户={task.user_id}"
         )
         while not worker.done():
-            now = time.time()
+            now = time.monotonic()
             if now >= hard_deadline:
                 break
             if now - last_change >= grace:
@@ -452,6 +483,7 @@ class VideoExportQueue:
                         f"{task.task_id[:8]}"
                     )
         if not worker.done():
+            task.cancel_requested = True
             worker.cancel()
             try:
                 await worker
@@ -470,22 +502,38 @@ class VideoExportQueue:
     async def _handle_failure(self, task: QueueTask, error: Exception):
         """任务协程抛错：按重试预算重新入队或结算为失败。"""
         logger.error(f"任务执行失败: {task.task_id[:8]}, 错误={error}")
-        if task.retry_count < task.max_retries:
-            task.retry_count += 1
-            task.status = TaskStatus.PENDING
-            task.started_at = None
-            task.progress = 0
-            task.error = None
-
-            async with self._lock:
+        if isinstance(error, PermanentTaskError):
+            # 重试必然复现的失败（如任务自身超时、下载终败）不重试
+            self._settle(task, TaskStatus.FAILED, error=str(error))
+            logger.error(f"任务永久失败（不重试）: {task.task_id[:8]}, 错误={error}")
+            return
+        async with self._lock:
+            # 终态守卫：取消/停机结算过的任务不得在这里复活重入队
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
+                               TaskStatus.TIMEOUT, TaskStatus.CANCELLED):
+                return
+            if self._stopped:
+                self._settle(task, TaskStatus.CANCELLED, error="队列已停止")
+                return
+            if task.retry_count < task.max_retries:
+                task.retry_count += 1
+                task.started_at = None
+                task.progress = 0
+                task.error = None
+                # 清掉上一代已结束的 worker，取消路径不再被旧引用误导；
+                # 代次自增后，旧执行者的 finally 凭代次识别自己已过时
+                task.worker = None
+                task.generation += 1
+                # 状态改写与入队同锁原子完成：取消在窗口内要么走 RUNNING 分支、
+                # 要么在队列中找到它，不会再触发 list.remove 的 ValueError
+                task.status = TaskStatus.PENDING
                 if not any(t.task_id == task.task_id for t in self._queue):
                     self._queue.append(task)
                     self._queue.sort(key=lambda t: (t.priority, t.created_at))
-
-            logger.info(f"任务将重试: {task.task_id[:8]}, 第{task.retry_count}次重试")
-        else:
-            self._settle(task, TaskStatus.FAILED, error=str(error))
-            logger.error(f"任务最终失败: {task.task_id[:8]}, 已重试{task.retry_count}次")
+                logger.info(f"任务将重试: {task.task_id[:8]}, 第{task.retry_count}次重试")
+                return
+        self._settle(task, TaskStatus.FAILED, error=str(error))
+        logger.error(f"任务最终失败: {task.task_id[:8]}, 已重试{task.retry_count}次")
 
     async def _execute_task(self, task: QueueTask):
         """执行单个任务。
@@ -494,6 +542,12 @@ class VideoExportQueue:
         已下载完成的视频不会被误杀。取消（用户/停止队列）会真正中断协程并释放并发槽。
         """
         worker = None
+        gen = task.generation
+        # 入口终态守卫：取消/停止先于执行启动时（调度与 worker 赋值之间的窗口），
+        # 已结算的任务不再真正执行，避免"取消成功却照样渲染"
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
+                           TaskStatus.TIMEOUT, TaskStatus.CANCELLED):
+            return
         try:
             worker = asyncio.create_task(self._invoke(task))
             task.worker = worker
@@ -520,21 +574,32 @@ class VideoExportQueue:
                 raise
         except asyncio.CancelledError:
             if worker and not worker.done():
+                task.cancel_requested = True
                 worker.cancel()
                 try:
                     await worker
                 except (asyncio.CancelledError, Exception):
                     pass
-            self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
+            if task.generation == gen:
+                self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
             logger.info(f"任务已取消: {task.task_id[:8]}")
         except Exception as e:
-            await self._handle_failure(task, e)
+            if task.cancel_requested or (worker is not None and worker.cancelled()):
+                # 取消后协程清理代码抛出的普通异常：按取消结算，绝不复活重试
+                if task.generation == gen:
+                    self._settle(task, TaskStatus.CANCELLED, error="任务已取消")
+                logger.info(f"任务已取消: {task.task_id[:8]}")
+            else:
+                await self._handle_failure(task, e)
         finally:
             async with self._lock:
-                self._running_tasks.pop(task.task_id, None)
-            # 防御：正常路径都会先行结算；若仍处于 RUNNING 说明有未覆盖的退出路径
-            if task.status == TaskStatus.RUNNING:
-                self._settle(task, TaskStatus.FAILED, error="任务异常退出")
+                # 运行登记按"登记代次"匹配：重试已让任务被新一代重新登记时，
+                # 旧执行者不得移除新登记、也不得结算；自己的登记自己清
+                if task.registered_generation == gen:
+                    self._running_tasks.pop(task.task_id, None)
+                    # 防御：正常路径都会先行结算；若仍处于 RUNNING 说明有未覆盖的退出路径
+                    if task.status == TaskStatus.RUNNING:
+                        self._settle(task, TaskStatus.FAILED, error="任务异常退出")
 
     async def _cleanup_loop(self):
         """定期清理已完成的任务"""
@@ -576,7 +641,17 @@ class VideoExportQueue:
 
         return self._completed_tasks.get(task_id)
 
+    @property
+    def max_queue_size(self) -> int:
+        """队列容量（pending + running 的入队上限），供调用方在生成前做背压预检。"""
+        return self._max_queue_size
+
 
 class QueueFullError(Exception):
     """队列已满异常"""
+    pass
+
+
+class PermanentTaskError(Exception):
+    """不可重试的任务失败：重试也必然复现（任务自身超时、下载终败等），直接结算失败。"""
     pass
