@@ -616,7 +616,7 @@ ChangeLayoutMode -> BlackOut -> ChangeBackgroundImage -> BlackIn -> LayoutAppear
 
 
 
-@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.4", "https://github.com/yonglanws/astrbot_plugin_msst")
+@register("MySekaiStoryteller", "慵懒午睡", "MySekaiStoryteller 视频生成插件", "1.1.6", "https://github.com/yonglanws/astrbot_plugin_msst")
 class MySekaiStorytellerPlugin(Star):
     """
     MySekaiStoryteller 插件主类
@@ -2638,8 +2638,9 @@ class MySekaiStorytellerPlugin(Star):
             if not user_id:
                 user_id = str(event.get_sender_id())
 
-            # 先发送艾特通知；通知是锦上添花，失败绝不拦住视频发送本身
-            if user_id:
+            # 先发送艾特通知；仅群聊发送（协议端拒绝私聊 At，retcode 1400），
+            # 且通知是锦上添花，失败绝不拦住视频发送本身
+            if user_id and self._at_allowed(event_context, event):
                 try:
                     try:
                         qq_id = int(user_id)
@@ -2733,20 +2734,28 @@ class MySekaiStorytellerPlugin(Star):
             logger.error(f"发送视频失败: {e}")
             await self._send_safe_message(event, f"❌ 视频发送失败: {str(e)}", event_context)
 
+    @staticmethod
+    def _at_allowed(event_context: dict, event: AstrMessageEvent = None) -> bool:
+        """艾特组件只在群聊发送：QQ 协议端对私聊 At 返回 retcode 1400 直接拒收。"""
+        if event_context is not None:
+            return bool(event_context.get("group_id"))
+        return bool(getattr(event, 'group_id', ''))
+
     async def _send_safe_message(self, event: AstrMessageEvent, message: str, event_context: dict = None):
         """安全发送消息（避免异常）；艾特失败时降级为纯文本重试一次。"""
         unified_msg_origin = event_context.get("unified_msg_origin", "") if event_context else getattr(event, 'unified_msg_origin', '')
         user_id = event_context.get("user_id", "") if event_context else str(event.get_sender_id())
+        with_at = self._at_allowed(event_context, event)
 
-        async def _send(with_at: bool) -> None:
+        async def _send(at: bool) -> None:
             chain = []
-            if with_at and user_id:
+            if at and user_id:
                 chain.append(Comp.At(qq=user_id))
             chain.append(Comp.Plain(message))
             await self.context.send_message(unified_msg_origin, MessageChain(chain=chain))
 
         try:
-            await _send(True)
+            await _send(with_at)
         except Exception as e:
             logger.error(f"发送消息失败（尝试纯文本重试）: {e}")
             try:
